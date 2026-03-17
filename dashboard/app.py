@@ -129,7 +129,7 @@ class DashboardBridge(threading.Thread):
         phase_snap = self._state.snapshot_phase()
 
         # Compute congestion level from total PCU density
-        total_density = sum(s.get("density", 0.0) for s in arm_snap.values())
+        total_density = sum(getattr(s, "density", 0.0) for s in arm_snap.values())
         if total_density < 12:
             congestion = "LOW"
         elif total_density < 28:
@@ -528,7 +528,7 @@ def _render_alert_banners(arm_data: dict, phase_data: dict) -> None:
 
     if phase == "emergency":
         emrg_arm = next(
-            (arm for arm, s in arm_data.items() if s.get("emergency")), "Unknown"
+            (arm for arm, s in arm_data.items() if getattr(s, "emergency")), "Unknown"
         )
         st.error(f"🚨 **EMERGENCY OVERRIDE ACTIVE** — {emrg_arm} arm has priority. "
                  "All other arms are RED.")
@@ -539,9 +539,9 @@ def _render_alert_banners(arm_data: dict, phase_data: dict) -> None:
                 "WALK signal active. All vehicle arms RED.")
 
     hazard_arms = {
-        arm: s.get("hazard")
+        arm: getattr(s, "hazard")
         for arm, s in arm_data.items()
-        if s.get("hazard")
+        if getattr(s, "hazard")
     }
     if hazard_arms:
         hazard_str = ", ".join(
@@ -559,10 +559,10 @@ def _render_camera_grid(arm_data: dict, phase_data: dict) -> None:
 
     for i, arm in enumerate(_ARM_NAMES):
         s         = arm_data.get(arm, {})
-        density   = s.get("density",   0.0)
-        wait      = s.get("wait_time", 0.0)
-        emergency = s.get("emergency", False)
-        hazard    = s.get("hazard",    False)
+        density   = getattr(s, "density",   0.0)
+        wait      = getattr(s, "wait_time", 0.0)
+        emergency = getattr(s, "emergency", False)
+        hazard    = getattr(s, "hazard",    False)
         is_green  = (arm == current_green)
 
         with cols[i]:
@@ -631,8 +631,8 @@ def _render_analytics(arm_data: dict) -> None:
     cols = st.columns(4)
     for i, arm in enumerate(_ARM_NAMES):
         s         = arm_data.get(arm, {})
-        density   = s.get("density",   0.0)
-        wait      = s.get("wait_time", 0.0)
+        density   = getattr(s, "density",   0.0)
+        wait      = getattr(s, "wait_time", 0.0)
 
         with cols[i]:
             st.markdown(f"**{arm} Arm**")

@@ -153,7 +153,10 @@ class DetectionThread(threading.Thread):
         logger.info("Detection pipeline initialized")
 
         # ── Wait for at least one camera to deliver a frame ────────────────
-        ready = self._camera_mgr.wait_for_first_frame("North", timeout=15.0)
+        ready = any(
+                self._camera_mgr.wait_for_first_frame(arm, timeout=15.0)
+                for arm in ["North","South","East","West"]
+            )
         if not ready:
             logger.critical("No frames from cameras after 15s — aborting")
             with self._state.lock:
@@ -184,10 +187,29 @@ class DetectionThread(threading.Thread):
 
             # For now, use North arm as the primary frame for display.
             # In a full system, you could stitch all 4 or process each independently.
-            frame = frames.get("North")
-            if frame is None:
-                time.sleep(0.01)
-                continue
+            for arm, frame in frames.items():
+
+                if frame is None:
+                    continue
+
+                quality = check_frame_quality(frame)
+                if not quality['is_usable']:
+                    continue
+
+                processed = frame
+
+                t0 = time.perf_counter()
+                detections = self._detector.detect(processed)
+                self._inference_ms = (time.perf_counter() - t0) * 1000
+
+                density_result = self._density.update(detections)
+                flow_result = self._flow.update(processed)
+                emrg_result = self._emergency.update(detections)
+
+                with self._state.lock:
+                    self._state.update_from_density(density_result)
+                    self._state.update_from_flow(flow_result)
+                    self._state.update_from_emergency(emrg_result)
 
             # ── Quality gate ───────────────────────────────────────────────
             quality = check_frame_quality(frame)
@@ -244,7 +266,18 @@ class DetectionThread(threading.Thread):
 
     def _annotate(self, frame: np.ndarray, detections, emrg_result) -> np.ndarray:
         """Build the annotated frame shown in Pygame camera panel."""
-        arm_snap = self._state.snapshot_arms()
+        arm_snap_raw = self._state.snapshot_arms()
+
+        arm_snap = {
+            arm: {
+                "signal": s.signal,
+                "density": s.density,
+                "wait_time": s.wait_time,
+                "emergency": s.emergency,
+                "hazard": s.hazard,
+            }
+            for arm, s in arm_snap_raw.items()
+        }
 
         out = draw_debug_overlay(
             frame, detections, arm_snap,
@@ -333,7 +366,7 @@ def _setup_signal_handlers(state: IntersectionState) -> None:
 
 def _status_printer(state: IntersectionState, camera_mgr: Optional[CameraManager] = None) -> None:
     """Print one-line status every 5s with camera health info."""
-    while True:
+    while state.running:
         with state.lock:
             running = state.running
 
@@ -396,7 +429,7 @@ def main() -> None:
             source = VIDEO_SOURCE
 
         # Validate file source
-        if isinstance(source, str) and not source.isdigit():
+        if isinstance(source, str) and not source.isdigit() and not source.startswith("rtsp://"):
             if not os.path.exists(source):
                 logger.warning("Source not found: %s — falling back to webcam 0", source)
                 source = 0
@@ -453,6 +486,9 @@ def main() -> None:
     status_thread.start()
 
     # ── Dashboard bridge ──────────────────────────────────────────────────
+    while detection_thread.emergency_detector is None:
+        time.sleep(0.1)
+
     dashboard_bridge = DashboardBridge(
         state,
         emergency_detector=detection_thread.emergency_detector

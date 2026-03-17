@@ -62,6 +62,10 @@ class IntersectionState:
             # Update hazard flags based on emergency result
             for arm in self.arms.values():
                 arm.hazard = arm.arm_name in emrg_result.hazard_arms
+                arm.emergency = (
+                        emrg_result.emergency_detected
+                        and emrg_result.emergency_arm == arm.arm_name
+                )
                 if emrg_result.emergency_detected and emrg_result.emergency_arm == arm.arm_name:
                     arm.emergency = True
 
@@ -69,6 +73,12 @@ class IntersectionState:
         with self.lock:
             if frame is not None:
                 self.annotated_frame = frame.copy()
+
+    def get_annotated_frame(self):
+        with self.lock:
+            if self.annotated_frame is None:
+                return None
+            return self.annotated_frame.copy()
 
     def set_signal(self, arm: Optional[str], signal_color: str):
         # if arm is None, set all arms
@@ -110,8 +120,11 @@ class IntersectionState:
     def snapshot_phase(self) -> Dict[str, Any]:
         with self.lock:
             return {
+                "phase": self.phase,
+                "current_green": self.current_green,
+                "ped_rolling_avg": self.ped_rolling_avg,
                 "total_cycles": self.total_cycles,
-                "vehicles_cleared": self.total_cycles * 5, 
+                "vehicles_cleared": self.total_cycles * 5,
                 "uptime_s": time.time() - self.start_time,
             }
 

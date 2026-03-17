@@ -26,6 +26,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+
+
 try:
     import pygame
     import pygame.gfxdraw
@@ -867,11 +869,11 @@ class PygameSimulation:
 
         for i, arm in enumerate(ARM_NAMES):
             s      = arm_snap.get(arm, {})
-            sig    = s.get('signal', 'RED')
-            dens   = s.get('density', 0.0)
-            wait   = s.get('wait_time', 0.0)
-            emrg   = s.get('emergency', False)
-            hzrd   = s.get('hazard', False)
+            sig  = getattr(s, "signal", "RED")
+            dens = getattr(s, "density", 0.0)
+            wait = getattr(s, "wait_time", 0.0)
+            emrg = getattr(s, "emergency", False)
+            hzrd = getattr(s, "hazard", False)
             is_grn = (arm == current_green)
 
             sig_color = (C_TEXT_GREEN if sig == 'GREEN' else
@@ -911,9 +913,9 @@ class PygameSimulation:
         phase_snap   = self._state.snapshot_phase()
         arm_snap     = self._state.snapshot_arms()
         phase        = phase_snap.get('phase', 'normal')
-        emrg_arm     = next((a for a, s in arm_snap.items() if s.get('emergency')), None)
-        hzrd_info    = next(((a, s.get('hazard')) for a, s in arm_snap.items()
-                             if s.get('hazard')), None)
+        emrg_arm = next((a for a, s in arm_snap.items() if getattr(s, "emergency", False)), None)
+        hzrd_info = next(((a, getattr(s, "hazard", False)) for a, s in arm_snap.items() 
+                        if getattr(s, "hazard", False)), None)
 
         banner_h = 30
         banner   = pygame.Surface((SIM_PANEL_W, banner_h), pygame.SRCALPHA)
@@ -1100,8 +1102,8 @@ class PygameSimulation:
         phase_snap = self._state.snapshot_phase()
         arm_snap   = self._state.snapshot_arms()
         phase      = phase_snap.get('phase', 'normal')
-        emrg_arm   = next((a for a, s in arm_snap.items() if s.get('emergency')), None)
-        hzrd_info  = next(((a, s.get('hazard')) for a, s in arm_snap.items() if s.get('hazard')), None)
+        emrg_arm = next((a for a, s in arm_snap.items() if getattr(s, "emergency", False)), None)
+        hzrd_info = next(((a, getattr(s, "hazard", False)) for a, s in arm_snap.items() if getattr(s, "hazard", False)), None)
 
         bh      = 32
         b_rect  = pygame.Rect(cam_rect.x, cam_rect.y, cam_rect.w, bh)
@@ -1148,10 +1150,10 @@ class PygameSimulation:
         y += 4
 
         for arm in ARM_NAMES:
-            s      = arm_snap.get(arm, {})
-            sig    = s.get('signal', 'RED')
-            dens   = s.get('density', 0.0)
-            wait   = s.get('wait_time', 0.0)
+            s = arm_snap.get(arm, {})
+            sig = getattr(s, 'signal', 'RED')
+            dens = getattr(s, 'density', 0.0)
+            wait = getattr(s, 'wait_time', 0.0)
             is_grn = (arm == phase_snap.get('current_green'))
 
             sig_color = (C_TEXT_GREEN if sig == 'GREEN' else
