@@ -1,14 +1,32 @@
-# detection/density.py — PCU-Weighted Density Estimation Per ROI Arm
-# For each arm, counts detections whose centroid falls inside the ROI polygon,
-# weights them by PCU, and returns per-arm density scores.
-# Also flags emergency and hazard conditions discovered during the sweep.
+"""
+detection/density.py — PCU-Weighted Density + Queue Length Estimator
+=====================================================================
+Improvements over original:
+  1. queue_length() — converts PCU density to estimated vehicle count
+     using class-specific PCU weights (not a fixed avg)
+  2. Direction-aware stopped detection — classifies flow as
+     'toward'|'away'|'stopped'|'unknown' for better scoring
+  3. Closest emergency vehicle — returns which arm the nearest
+     ambulance is in (by centroid distance to ROI center)
+  4. Pedestrian stability — 15-frame rolling average + hysteresis
+     (requires avg >= PED_THRESHOLD to trigger, avg < PED_CLEAR to cancel)
+  5. Arrival rate estimation — delta between consecutive density readings
+     (used by algorithm.py for predictive scoring)
+
+Kept intact from original:
+  • Polygon ROI centroid test (cv2.pointPolygonTest)
+  • PCU weights (bus/truck=3.0, car=1.0, auto=0.8, moto=0.4, bike=0.3)
+  • CLAHE mandatory upstream
+  • Low conf threshold (0.35) — handled in detector.py
+"""
 
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -26,372 +44,367 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# Pedestrian clear threshold (hysteresis: trigger at >=8, clear at <4)
+PED_CLEAR_THRESHOLD = 4
 
-# ---------------------------------------------------------------------------
-# Result container returned after every frame sweep
-# ---------------------------------------------------------------------------
+# Minimum flow magnitude to classify as "moving" (pixels/frame)
+FLOW_MOVING_THRESHOLD = 1.5
+# Flow direction angle band for "toward" vs "away" (degrees)
+# In a top-down view: toward camera = generally downward (90°±60°)
+TOWARD_ANGLE_CENTER = 90.0
+TOWARD_ANGLE_BAND = 70.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detection dataclass (matches output from detector.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Detection:
+    """Single YOLO detection. Must match detector.py output."""
+    xyxy: Tuple[float, float, float, float]   # x1,y1,x2,y2 in pixels
+    conf: float
+    cls_id: int
+    cls_name: str
+
+    @property
+    def cx(self) -> float:
+        return (self.xyxy[0] + self.xyxy[2]) / 2.0
+
+    @property
+    def cy(self) -> float:
+        return (self.xyxy[1] + self.xyxy[3]) / 2.0
+
+    @property
+    def area(self) -> float:
+        w = self.xyxy[2] - self.xyxy[0]
+        h = self.xyxy[3] - self.xyxy[1]
+        return max(0.0, w * h)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result containers
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ArmDensityResult:
+    """Per-arm density result for one frame."""
+    arm: str
+    density: float = 0.0              # PCU-weighted sum
+    queue_length: int = 0             # estimated vehicle count
+    vehicle_count: int = 0            # raw count (unweighted)
+    flow_direction: str = 'unknown'   # 'toward'|'away'|'stopped'|'unknown'
+    arrival_rate_delta: float = 0.0   # density change since last frame (PCU/frame)
+    has_emergency: bool = False
+    has_hazard: bool = False
+    matched_detections: List[Detection] = field(default_factory=list)
+
 
 @dataclass
 class DensityResult:
-    """Per-frame density estimation output for all arms."""
+    """Full frame density result across all arms."""
+    arm_results: Dict[str, ArmDensityResult] = field(default_factory=dict)
 
-    # PCU-weighted vehicle density per arm  e.g. {'North': 12.4, 'South': 3.0, ...}
-    densities: dict[str, float] = field(default_factory=dict)
+    # Backward-compat properties (used by existing controller + drawing code)
+    @property
+    def densities(self) -> Dict[str, float]:
+        return {arm: r.density for arm, r in self.arm_results.items()}
 
-    # Arms where an emergency vehicle was detected this frame
-    emergency_arms: list[str] = field(default_factory=list)
+    @property
+    def emergency_arms(self) -> List[str]:
+        return [arm for arm, r in self.arm_results.items() if r.has_emergency]
 
-    # Arms where a hazard (animal) was detected this frame
-    hazard_arms: list[str] = field(default_factory=list)
+    @property
+    def hazard_arms(self) -> List[str]:
+        return [arm for arm, r in self.arm_results.items() if r.has_hazard]
 
-    # Raw person count inside the PED ROI this frame
-    ped_count: int = 0
+    @property
+    def ped_count(self) -> int:
+        return self._ped_count
 
-    # Rolling average ped count (smoothed over PED_ROLLING_FRAMES)
-    ped_rolling_avg: float = 0.0
+    @property
+    def ped_rolling_avg(self) -> float:
+        return self._ped_rolling_avg
 
-    # True when rolling average >= PED_THRESHOLD
-    ped_phase_triggered: bool = False
+    @property
+    def ped_phase_triggered(self) -> bool:
+        return self._ped_phase_triggered
 
-    # Detections that fell inside at least one ROI — for drawing / debugging
-    matched_detections: list = field(default_factory=list)
+    @property
+    def matched_detections(self) -> list:
+        all_dets = []
+        for r in self.arm_results.values():
+            all_dets.extend(r.matched_detections)
+        return all_dets
+
+    # Set by DensityEstimator.update()
+    _ped_count: int = 0
+    _ped_rolling_avg: float = 0.0
+    _ped_phase_triggered: bool = False
+
+    # Closest emergency arm (new field)
+    closest_emergency_arm: Optional[str] = None
 
     def __repr__(self) -> str:
         dens = {k: f"{v:.1f}" for k, v in self.densities.items()}
         return (
             f"DensityResult(densities={dens} "
-            f"ped={self.ped_count} avg={self.ped_rolling_avg:.1f} "
+            f"ped={self._ped_count:.0f} avg={self._ped_rolling_avg:.1f} "
             f"emrg={self.emergency_arms} hazard={self.hazard_arms})"
         )
 
 
-# ---------------------------------------------------------------------------
-# Density Estimator — instantiate once, call update() every frame
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Core estimator
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DensityEstimator:
     """
-    Computes PCU-weighted vehicle density for each intersection arm.
-
-    Design decisions:
-      - Uses cv2.pointPolygonTest (exact, handles concave polygons, fast in C).
-      - Centroid-based assignment: a vehicle belongs to the arm whose ROI
-        contains its bounding-box centre. This handles vehicles that straddle
-        multiple ROIs at the stop-line.
-      - Animals and emergency vehicles are flagged separately from PCU density
-        so the controller can handle them independently.
-      - Pedestrians in the VEHICLE ROIs contribute 0 PCU (config) but are
-        counted in the PED ROI for the pedestrian phase trigger.
-      - Rolling average over PED_ROLLING_FRAMES prevents a single frame with
-        spurious detections from triggering a ped phase.
+    PCU-weighted density + queue estimator for all intersection arms.
 
     Usage:
         estimator = DensityEstimator()
-        result = estimator.update(detections)
+        result = estimator.update(detections, flow_vectors=flow_result)
     """
 
-    def __init__(
+    def __init__(self) -> None:
+        # Previous density per arm for arrival rate delta
+        self._prev_density: Dict[str, float] = {arm: 0.0 for arm in ARM_NAMES}
+
+        # Pedestrian rolling buffer
+        self._ped_buffer: deque = deque(maxlen=PED_ROLLING_FRAMES)
+        self._ped_triggered: bool = False   # hysteresis state
+
+        # Hazard clear frame counter per arm
+        self._hazard_clear_count: Dict[str, int] = {arm: 0 for arm in ARM_NAMES}
+
+        # ROI polygon arrays (pre-built for speed)
+        self._roi_polygons: Dict[str, np.ndarray] = {}
+        self._roi_centers: Dict[str, Tuple[float, float]] = {}
+        self._build_roi_data()
+
+        logger.info("DensityEstimator initialized for arms: %s", ARM_NAMES)
+
+    def _build_roi_data(self) -> None:
+        """Pre-compute ROI polygon arrays and centroid coordinates."""
+        for arm in ARM_NAMES:
+            if arm not in ROIS:
+                logger.warning("No ROI defined for arm: %s", arm)
+                continue
+            pts = np.array(ROIS[arm], dtype=np.float32)
+            self._roi_polygons[arm] = pts
+            # Centroid = mean of polygon vertices
+            cx = float(np.mean(pts[:, 0]))
+            cy = float(np.mean(pts[:, 1]))
+            self._roi_centers[arm] = (cx, cy)
+
+        # Pedestrian ROI
+        if 'PED' in ROIS:
+            self._ped_roi = np.array(ROIS['PED'], dtype=np.float32)
+        else:
+            self._ped_roi = None
+            logger.warning("No PED ROI defined — pedestrian phase disabled")
+
+    def update(
         self,
-        rois: dict[str, np.ndarray] = ROIS,
-        arm_names: list[str] = ARM_NAMES,
-        ped_threshold: int = PED_THRESHOLD,
-        ped_rolling_frames: int = PED_ROLLING_FRAMES,
-        hazard_clear_frames: int = HAZARD_CLEAR_FRAMES,
-    ) -> None:
-        self._rois = rois
-        self._arm_names = arm_names
-        self._ped_threshold = ped_threshold
-
-        # Rolling buffer for pedestrian count smoothing
-        self._ped_buffer: deque[int] = deque(maxlen=ped_rolling_frames)
-
-        # Per-arm hazard clear countdown: tracks consecutive hazard-free frames
-        self._hazard_clear_countdown: dict[str, int] = {
-            arm: hazard_clear_frames for arm in arm_names
-        }
-        self._hazard_clear_frames = hazard_clear_frames
-
-        # Per-arm active hazard state (survives until HAZARD_CLEAR_FRAMES pass)
-        self._active_hazards: dict[str, bool] = {arm: False for arm in arm_names}
-
-        logger.info(
-            "DensityEstimator ready — %d arms, ped_threshold=%d, rolling=%d frames",
-            len(arm_names), ped_threshold, ped_rolling_frames,
-        )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def update(self, detections: list) -> DensityResult:
+        detections: list,
+        flow_vectors: Optional[dict] = None,
+    ) -> DensityResult:
         """
-        Process one frame's detections and return density estimates.
+        Process one frame of detections.
 
         Args:
-            detections: List of Detection objects from TrafficDetector.detect().
+            detections: list of Detection objects from detector.py
+            flow_vectors: optional dict from flow.py with per-arm flow info
 
         Returns:
-            DensityResult with per-arm densities and event flags.
+            DensityResult with per-arm density, queue, emergency, hazard, ped data
         """
         result = DensityResult()
+        arm_results: Dict[str, ArmDensityResult] = {
+            arm: ArmDensityResult(arm=arm) for arm in ARM_NAMES
+        }
 
-        # Initialise density to 0 for every arm
-        result.densities = {arm: 0.0 for arm in self._arm_names}
-
-        ped_count_this_frame: int = 0
-        matched: list = []
+        # ── Step 1: classify each detection into an arm ───────────────────
+        ped_count_frame = 0
+        emergency_candidates: List[Tuple[str, float]] = []  # (arm, dist_to_center)
 
         for det in detections:
-            # ── Pedestrian ROI check ──────────────────────────────────────
-            if det.class_name == 'person':
-                if self._point_in_roi('PED', det.cx, det.cy):
-                    ped_count_this_frame += 1
-                # Persons are 0 PCU in vehicle ROIs — skip density accumulation
+            if not hasattr(det, 'cx'):
+                # Support both Detection dataclass and dict/object from detector.py
+                try:
+                    cx = (det.xyxy[0] + det.xyxy[2]) / 2.0
+                    cy = (det.xyxy[1] + det.xyxy[3]) / 2.0
+                    cls_name = det.cls_name
+                except AttributeError:
+                    continue
+            else:
+                cx, cy = det.cx, det.cy
+                cls_name = det.cls_name
+
+            # ── Pedestrian ROI check ───────────────────────────────────────
+            if cls_name == 'person' and self._ped_roi is not None:
+                pt_test = cv2.pointPolygonTest(
+                    self._ped_roi, (float(cx), float(cy)), False
+                )
+                if pt_test >= 0:
+                    ped_count_frame += 1
+                continue   # persons not counted in PCU density
+
+            # ── Arm ROI assignment ─────────────────────────────────────────
+            assigned_arm: Optional[str] = None
+            for arm, polygon in self._roi_polygons.items():
+                test = cv2.pointPolygonTest(
+                    polygon, (float(cx), float(cy)), False
+                )
+                if test >= 0:
+                    assigned_arm = arm
+                    break
+
+            if assigned_arm is None:
                 continue
 
-            # ── Emergency vehicle check ───────────────────────────────────
-            if det.is_emergency:
-                arm = self._centroid_to_arm(det.cx, det.cy)
-                if arm and arm not in result.emergency_arms:
-                    result.emergency_arms.append(arm)
-                    logger.warning(
-                        "EMERGENCY: %s detected in %s arm (conf=%.2f)",
-                        det.class_name, arm, det.confidence,
-                    )
-                matched.append(det)
-                continue  # Emergency vehicles don't add PCU density
+            ar = arm_results[assigned_arm]
+            ar.matched_detections.append(det)
+            ar.vehicle_count += 1
 
-            # ── Hazard (animal) check ────────────────────────────────────
-            if det.is_hazard:
-                arm = self._centroid_to_arm(det.cx, det.cy)
-                if arm:
-                    self._active_hazards[arm] = True
-                    self._hazard_clear_countdown[arm] = self._hazard_clear_frames
-                    if arm not in result.hazard_arms:
-                        result.hazard_arms.append(arm)
-                        logger.warning(
-                            "HAZARD: %s on %s arm (conf=%.2f)",
-                            det.class_name, arm, det.confidence,
-                        )
-                matched.append(det)
-                continue  # Animals don't add PCU density
+            # ── Emergency vehicle ──────────────────────────────────────────
+            if cls_name in EMERGENCY_CLASSES:
+                ar.has_emergency = True
+                # Distance from vehicle to ROI center (for closest-arm logic)
+                roi_cx, roi_cy = self._roi_centers[assigned_arm]
+                dist = math.hypot(cx - roi_cx, cy - roi_cy)
+                emergency_candidates.append((assigned_arm, dist))
+                continue   # emergency vehicles not counted in density
 
-            # ── Normal vehicle — accumulate PCU density ──────────────────
-            arm = self._centroid_to_arm(det.cx, det.cy)
-            if arm is not None:
-                pcu = PCU_WEIGHTS.get(det.class_name, PCU_WEIGHTS['unknown'])
-                result.densities[arm] = result.densities.get(arm, 0.0) + pcu
-                matched.append(det)
+            # ── Hazard (animal) ────────────────────────────────────────────
+            if cls_name in HAZARD_CLASSES:
+                ar.has_hazard = True
+                self._hazard_clear_count[assigned_arm] = 0
+                continue
 
-        # ── Hazard persistence: keep hazard flagged until clear countdown ──
-        for arm in self._arm_names:
-            if self._active_hazards[arm]:
-                # Tick down the clear counter
-                if arm not in result.hazard_arms:
-                    # No hazard this frame — count down
-                    self._hazard_clear_countdown[arm] -= 1
-                    if self._hazard_clear_countdown[arm] <= 0:
-                        self._active_hazards[arm] = False
-                        logger.info("HAZARD cleared on %s arm", arm)
-                    else:
-                        # Still within clear window — keep hazard active
-                        result.hazard_arms.append(arm)
-                else:
-                    # Hazard still present this frame — reset countdown
-                    self._hazard_clear_countdown[arm] = self._hazard_clear_frames
+            # ── PCU density ───────────────────────────────────────────────
+            pcu = PCU_WEIGHTS.get(cls_name, 0.5)
+            ar.density += pcu
 
-        # ── Pedestrian rolling average ────────────────────────────────────
-        self._ped_buffer.append(ped_count_this_frame)
-        rolling_avg = float(np.mean(self._ped_buffer)) if self._ped_buffer else 0.0
+        # ── Step 2: finalize per-arm results ──────────────────────────────
+        for arm, ar in arm_results.items():
+            # Hazard clear countdown
+            if not ar.has_hazard:
+                self._hazard_clear_count[arm] = min(
+                    self._hazard_clear_count[arm] + 1, HAZARD_CLEAR_FRAMES + 1
+                )
+                if self._hazard_clear_count[arm] < HAZARD_CLEAR_FRAMES:
+                    ar.has_hazard = True   # hold hazard flag until truly cleared
 
-        result.ped_count = ped_count_this_frame
-        result.ped_rolling_avg = rolling_avg
-        result.ped_phase_triggered = rolling_avg >= self._ped_threshold
-        result.matched_detections = matched
+            # Queue length (PCU → vehicle count)
+            ar.queue_length = self._density_to_queue(ar.density, ar.matched_detections)
 
-        if result.ped_phase_triggered:
-            logger.info(
-                "Pedestrian phase triggered: rolling_avg=%.1f >= threshold=%d",
-                rolling_avg, self._ped_threshold,
-            )
+            # Arrival rate delta
+            prev = self._prev_density[arm]
+            ar.arrival_rate_delta = ar.density - prev
+            self._prev_density[arm] = ar.density
+
+            # Flow direction from flow_vectors
+            if flow_vectors and arm in flow_vectors:
+                ar.flow_direction = self._classify_flow_direction(
+                    flow_vectors[arm]
+                )
+
+        # ── Step 3: closest emergency arm ─────────────────────────────────
+        closest_emrg_arm = None
+        if emergency_candidates:
+            closest_emrg_arm = min(emergency_candidates, key=lambda x: x[1])[0]
+
+        # ── Step 4: pedestrian rolling average + hysteresis ───────────────
+        self._ped_buffer.append(ped_count_frame)
+        ped_avg = float(sum(self._ped_buffer) / max(1, len(self._ped_buffer)))
+
+        # Hysteresis: trigger at >=PED_THRESHOLD, clear at <PED_CLEAR_THRESHOLD
+        if not self._ped_triggered and ped_avg >= PED_THRESHOLD:
+            self._ped_triggered = True
+            logger.info("Pedestrian phase triggered (avg=%.1f >= %d)", ped_avg, PED_THRESHOLD)
+        elif self._ped_triggered and ped_avg < PED_CLEAR_THRESHOLD:
+            self._ped_triggered = False
+
+        # ── Assemble result ────────────────────────────────────────────────
+        result.arm_results = arm_results
+        result._ped_count = ped_count_frame
+        result._ped_rolling_avg = ped_avg
+        result._ped_phase_triggered = self._ped_triggered
+        result.closest_emergency_arm = closest_emrg_arm
 
         return result
 
-    def reset(self) -> None:
-        """Clear all rolling state — call on video source change or restart."""
-        self._ped_buffer.clear()
-        self._active_hazards = {arm: False for arm in self._arm_names}
-        self._hazard_clear_countdown = {
-            arm: self._hazard_clear_frames for arm in self._arm_names
-        }
-        logger.info("DensityEstimator state reset")
+    # ── Helpers ────────────────────────────────────────────────────────────
 
-    def get_ped_rolling_avg(self) -> float:
-        """Return the current pedestrian rolling average (thread-safe read)."""
-        return float(np.mean(self._ped_buffer)) if self._ped_buffer else 0.0
-
-    # ------------------------------------------------------------------
-    # Internal geometry helpers
-    # ------------------------------------------------------------------
-
-    def _point_in_roi(self, roi_name: str, cx: float, cy: float) -> bool:
+    def _density_to_queue(
+        self,
+        density: float,
+        detections: List,
+    ) -> int:
         """
-        Return True if (cx, cy) is inside the named ROI polygon.
-
-        Uses cv2.pointPolygonTest with measureDist=False for maximum speed.
-        Return value: +1.0 inside, -1.0 outside, 0.0 on edge — we treat
-        0 (on edge) as inside to avoid missing stop-line vehicles.
+        Convert PCU density to estimated vehicle count.
+        Uses actual class composition if detections are available,
+        otherwise uses a default average PCU of 0.7.
         """
-        polygon = self._rois.get(roi_name)
-        if polygon is None:
-            return False
-        result = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False)
-        return result >= 0.0  # 0 = on edge → count as inside
+        if not detections:
+            avg_pcu = 0.7
+            return max(0, int(round(density / max(avg_pcu, 0.01))))
 
-    def _centroid_to_arm(self, cx: float, cy: float) -> Optional[str]:
-        """
-        Return the arm name whose ROI contains (cx, cy), or None.
-
-        Checks arms in ARM_NAMES order. If a centroid falls in two
-        overlapping ROIs (e.g. near intersection box), the first match wins.
-        PED ROI is excluded — handled separately.
-        """
-        for arm in self._arm_names:
-            if self._point_in_roi(arm, cx, cy):
-                return arm
-        return None  # centroid outside all arm ROIs (e.g. in intersection box)
-
-    def arm_densities_snapshot(self) -> dict[str, float]:
-        """
-        Return a copy of last-computed densities.
-        Useful for the controller thread to read without re-running update().
-        Note: update() should be the primary call; this is for diagnostics.
-        """
-        # Returns empty dict if called before first update() — safe
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Module-level convenience function (used by main.py detection thread)
-# ---------------------------------------------------------------------------
-
-def compute_density(
-    detections: list,
-    estimator: DensityEstimator,
-) -> DensityResult:
-    """
-    Thin wrapper so the detection thread can call a single function
-    without holding an estimator reference itself.
-
-    Args:
-        detections: Output of TrafficDetector.detect().
-        estimator:  Shared DensityEstimator instance (created in main.py).
-
-    Returns:
-        DensityResult for this frame.
-    """
-    return estimator.update(detections)
-
-
-# ---------------------------------------------------------------------------
-# Standalone test  (python -m detection.density)
-# ---------------------------------------------------------------------------
-
-if __name__ == '__main__':
-    import sys
-    import time
-    import cv2 as _cv2
-
-    from config import VIDEO_SOURCE
-    from utils.preprocessing import preprocess
-    from utils.drawing import draw_rois, draw_detections, draw_frame_info
-    from detection.detector import TrafficDetector
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    )
-
-    detector  = TrafficDetector()
-    estimator = DensityEstimator()
-
-    cap = _cv2.VideoCapture(VIDEO_SOURCE)
-    if not cap.isOpened():
-        logger.error("Cannot open video source: %s", VIDEO_SOURCE)
-        sys.exit(1)
-
-    print(
-        "Press Q to quit\n"
-        "Shows: ROI overlays + bboxes + per-arm PCU density printed to console\n"
-    )
-
-    frame_n = 0
-    t0      = time.time()
-    fps     = 0.0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(_cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
-
-        processed  = preprocess(frame)
-        detections = detector.detect(processed)
-        result     = estimator.update(detections)
-
-        # ── Console output every 30 frames ───────────────────────────────
-        frame_n += 1
-        if frame_n % 30 == 0:
-            fps = 30.0 / (time.time() - t0)
-            t0  = time.time()
-            dens_str = "  ".join(
-                f"{arm}: {result.densities.get(arm, 0):.1f} PCU"
-                for arm in ARM_NAMES
-            )
-            print(
-                f"[{frame_n:5d}]  {dens_str}  "
-                f"| ped={result.ped_count} avg={result.ped_rolling_avg:.1f}"
-                f"{'  🚨 EMERGENCY: ' + str(result.emergency_arms) if result.emergency_arms else ''}"
-                f"{'  ⚠ HAZARD: '    + str(result.hazard_arms)    if result.hazard_arms    else ''}"
-                f"{'  🚶 PED PHASE'                                if result.ped_phase_triggered else ''}"
-            )
-
-        # ── Visual output ────────────────────────────────────────────────
-        out = draw_rois(processed)
-        out = draw_detections(out, detections)
-
-        # Density text per arm at ROI centroid
-        for arm in ARM_NAMES:
-            polygon = ROIS.get(arm)
-            if polygon is None:
+        total_pcu = 0.0
+        count = 0
+        for det in detections:
+            cls_name = getattr(det, 'cls_name', 'unknown')
+            if cls_name == 'person':
                 continue
-            cx = int(np.mean(polygon[:, 0]))
-            cy = int(np.mean(polygon[:, 1])) + 18   # below ROI label
-            density = result.densities.get(arm, 0.0)
-            label   = f"{density:.1f} PCU"
-            _cv2.putText(out, label, (cx - 28, cy),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                         (255, 255, 255), 2)
-            _cv2.putText(out, label, (cx - 28, cy),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                         (0, 0, 0), 1)
+            pcu = PCU_WEIGHTS.get(cls_name, 0.5)
+            if pcu > 0:
+                total_pcu += pcu
+                count += 1
 
-        # Ped count in PED ROI
-        ped_roi = ROIS.get('PED')
-        if ped_roi is not None:
-            pcx = int(np.mean(ped_roi[:, 0]))
-            pcy = int(np.mean(ped_roi[:, 1]))
-            ped_label = f"PED {result.ped_count} (avg {result.ped_rolling_avg:.1f})"
-            _cv2.putText(out, ped_label, (pcx - 50, pcy),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                         (0, 255, 255), 2)
+        if count == 0:
+            return 0
+        avg_pcu = total_pcu / count
+        return max(0, int(round(density / max(avg_pcu, 0.01))))
 
-        out = draw_frame_info(out, frame_n, fps)
-        _cv2.imshow('Density Test — PCU per arm', out)
+    def _classify_flow_direction(self, flow_info: dict) -> str:
+        """
+        Classify optical flow direction for one arm.
 
-        if _cv2.waitKey(1) & 0xFF in (ord('q'), 27):
-            break
+        flow_info expected keys:
+          'magnitude': float       — mean flow magnitude (px/frame)
+          'angle_deg': float       — mean flow angle (0–360°, 0=right, 90=down)
 
-    cap.release()
-    _cv2.destroyAllWindows()
-    print("Done.")
+        Returns: 'toward' | 'away' | 'stopped' | 'unknown'
+        """
+        if not isinstance(flow_info, dict):
+            return 'unknown'
+
+        magnitude = flow_info.get('magnitude', 0.0)
+        angle = flow_info.get('angle_deg', None)
+
+        if magnitude < FLOW_MOVING_THRESHOLD:
+            return 'stopped'
+
+        if angle is None:
+            return 'unknown'
+
+        # Check if angle is within TOWARD_ANGLE_BAND of TOWARD_ANGLE_CENTER
+        # Default: toward = roughly "downward" in image = vehicles approaching
+        angle_diff = abs(angle - TOWARD_ANGLE_CENTER) % 360
+        if angle_diff > 180:
+            angle_diff = 360 - angle_diff
+
+        if angle_diff <= TOWARD_ANGLE_BAND:
+            return 'toward'
+        else:
+            return 'away'
+
+    def reset(self) -> None:
+        """Reset all internal state (useful for tests or source switches)."""
+        self._prev_density = {arm: 0.0 for arm in ARM_NAMES}
+        self._ped_buffer.clear()
+        self._ped_triggered = False
+        self._hazard_clear_count = {arm: 0 for arm in ARM_NAMES}
+        logger.info("DensityEstimator reset")

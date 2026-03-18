@@ -337,14 +337,14 @@ class ArduinoController:
 
     def get_send_callback(self):
         """
-        Return a (arm, phase, duration) → None callback suitable for
+        Return a (cmd_str) -> None callback suitable for
         passing directly to SignalController.__init__().
-
-        Usage:
-            arduino = ArduinoController()
-            controller = SignalController(state, send_command=arduino.get_send_callback())
         """
-        return lambda arm, phase, duration: self.send(arm, phase, duration)
+        def callback(cmd_str: str):
+            parts = cmd_str.strip().split(':')
+            if len(parts) >= 3:
+                self.send(parts[0], parts[1], int(parts[2]))
+        return callback
 
     # ------------------------------------------------------------------
     # Writer thread

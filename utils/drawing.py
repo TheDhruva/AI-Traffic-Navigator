@@ -146,7 +146,7 @@ def draw_detections(
 
     for det in detections:
         color = _bbox_color(det)
-        x1, y1, x2, y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
+        x1, y1, x2, y2 = map(int, det.xyxy)
 
         # Main bounding box (2px) + subtle inner highlight (1px, lighter)
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
@@ -157,11 +157,12 @@ def draw_detections(
         cv2.circle(out, (int(det.cx), int(det.cy)), 3, color, -1)
 
         # Label text
-        parts = [det.class_name]
+        parts = [det.cls_name]
         if show_confidence:
-            parts.append(f"{det.confidence:.2f}")
-        if show_pcu and det.pcu > 0:
-            parts.append(f"PCU={det.pcu}")
+            parts.append(f"{det.conf:.2f}")
+        pcu = getattr(det, "pcu", 0.0)
+        if show_pcu and pcu > 0:
+            parts.append(f"PCU={pcu}")
         label = " ".join(parts)
 
         _draw_label(out, label, x1, y1 - 6, color, font_scale=0.42, bg=True)
@@ -183,7 +184,7 @@ def draw_detection_count(
         return out
 
     from collections import Counter
-    counts = Counter(d.class_name for d in detections)
+    counts = Counter(d.cls_name for d in detections)
     summary = "  ".join(f"{cls}×{n}" for cls, n in counts.most_common(5))
     text = f"{len(detections)} det | {summary}"
 
@@ -483,11 +484,11 @@ def draw_debug_overlay(
 
 def _bbox_color(det) -> tuple[int, int, int]:
     """Return the correct BGR colour for a Detection object."""
-    if det.is_emergency:
+    if det.cls_name in EMERGENCY_CLASSES:
         return BBOX_COLORS['emergency']
-    if det.is_hazard:
+    if det.cls_name in HAZARD_CLASSES:
         return BBOX_COLORS['hazard']
-    if det.class_name == 'person':
+    if det.cls_name == 'person':
         return BBOX_COLORS['person']
     return BBOX_COLORS['default']
 

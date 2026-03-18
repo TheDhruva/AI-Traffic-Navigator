@@ -1,16 +1,17 @@
-# simulation/pygame_sim.py — Upgraded Interactive Intersection Simulation
-# =========================================================================
-# Upgrades over base version:
-#   • Interactive control panel strip (bottom of sim panel) — clickable spawn buttons
-#   • Manual spawn: Car / Bus / Auto / Bike / Pedestrian / Animal / Ambulance
-#   • Arm selector (N/S/E/W) — spawn targets the chosen arm
-#   • Auto-spawn mode — vehicles appear automatically at configurable rate
-#   • Zoom (mouse scroll + Z/X keys) with pan (middle-drag)
-#   • /tmp/control.json polling — live spawn_rate / sim_speed from Streamlit sidebar
-#   • /tmp/spawn.json polling  — one-shot spawns triggered from Streamlit sidebar
-#   • Zebra crossings, direction arrows, improved road markings
-#   • Vehicle count badges per arm entrance
-#   • New keyboard shortcuts: C/B/A/M/G/V/U + Z/X zoom + TAB cycle arm
+# simulation/pygame_sim.py — AI Smart Traffic Simulation (Bright Theme, 16:9)
+# =============================================================================
+# Full rewrite: 1600×900 true 16:9, bright high-contrast theme, larger fonts.
+# Layout:
+#   Left  panel (980px): top-down intersection + control strip
+#   Right panel (620px): camera feed (top) + metrics table (bottom)
+#
+# Keyboard shortcuts:
+#   Q/ESC   quit            E   emergency (North)     P   pedestrian rush
+#   C       spawn car       B   spawn bus             A   spawn auto
+#   M       spawn bike      V   animal hazard         U   ambulance
+#   TAB     cycle arm       1-4 force green arm       R   reset waits
+#   D       debug overlay   S   screenshot            SPACE pause
+#   Z/+     zoom in         X/- zoom out              0   reset zoom
 
 from __future__ import annotations
 
@@ -25,8 +26,6 @@ from typing import Optional
 
 import cv2
 import numpy as np
-
-
 
 try:
     import pygame
@@ -56,1231 +55,886 @@ from simulation.vehicles import (
 
 logger = logging.getLogger(__name__)
 
-# ── IPC paths ─────────────────────────────────────────────────────────────────
+# ── IPC ───────────────────────────────────────────────────────────────────────
 _CONTROL_FILE = Path("/tmp/control.json")
 _SPAWN_FILE   = Path("/tmp/spawn.json")
 
-# ── Window layout ─────────────────────────────────────────────────────────────
-WIN_W          = 1280
-WIN_H          = 800          # +80px vs base — space for control panel
-SIM_PANEL_W    = 720
-SIM_PANEL_H    = WIN_H        # full height
-CTRL_PANEL_H   = 90           # control panel strip height (inside sim panel, bottom)
-SIM_DRAW_H     = WIN_H - CTRL_PANEL_H   # drawable intersection area
-CAM_PANEL_X    = SIM_PANEL_W
-CAM_PANEL_W    = WIN_W - SIM_PANEL_W
-CAM_PANEL_H    = WIN_H
+# ── Window — true 16:9 ────────────────────────────────────────────────────────
+WIN_W        = 1600
+WIN_H        = 900
+SIM_PANEL_W  = 980          # left  — intersection + control strip
+CTRL_H       = 110          # control strip height at bottom of sim panel
+SIM_DRAW_H   = WIN_H - CTRL_H   # 790px — drawable intersection area
+CAM_PANEL_X  = SIM_PANEL_W
+CAM_PANEL_W  = WIN_W - SIM_PANEL_W   # 620px
 
-ROAD_WIDTH     = 80
-SIM_CX         = SIM_PANEL_W  // 2      # 360
-SIM_CY         = SIM_DRAW_H   // 2      # 355
+# Road geometry (within sim panel)
+ROAD_W       = 90
+SIM_CX       = SIM_PANEL_W // 2     # 490
+SIM_CY       = SIM_DRAW_H  // 2     # 395
 
-# Coordinate scalers (intersection → screen)
+# Coordinate scalers (800×800 vehicle-space → screen)
 def _sx(x: float) -> int: return int((x / ISECT_CX) * SIM_CX)
 def _sy(y: float) -> int: return int((y / ISECT_CY) * SIM_CY)
 def _sv(v: float) -> int: return int(v * (SIM_CX / ISECT_CX))
 
-# Signal light positions
-_SIG_R = 9
+# Signal light positions (cx, cy on sim surface)
+_SIG_R = 11
 _SIG_POS: dict[str, tuple[int, int]] = {
-    'North': (SIM_CX - ROAD_WIDTH // 2 - 18, _sy(ISECT_TOP)    - 22),
-    'South': (SIM_CX + ROAD_WIDTH // 2 + 18, _sy(ISECT_BOTTOM) + 22),
-    'East':  (_sx(ISECT_RIGHT)  + 22, SIM_CY - ROAD_WIDTH // 2 - 18),
-    'West':  (_sx(ISECT_LEFT)   - 22, SIM_CY + ROAD_WIDTH // 2 + 18),
+    'North': (SIM_CX - ROAD_W // 2 - 22, _sy(ISECT_TOP)    - 28),
+    'South': (SIM_CX + ROAD_W // 2 + 22, _sy(ISECT_BOTTOM) + 28),
+    'East':  (_sx(ISECT_RIGHT)  + 28, SIM_CY - ROAD_W // 2 - 22),
+    'West':  (_sx(ISECT_LEFT)   - 28, SIM_CY + ROAD_W // 2 + 22),
 }
 
-# Arm label positions (for vehicle count badge)
-_ARM_LABEL_POS: dict[str, tuple[int, int]] = {
-    'North': (SIM_CX - ROAD_WIDTH // 2 - 38, _sy(ISECT_TOP)    - 40),
-    'South': (SIM_CX - ROAD_WIDTH // 2 - 38, _sy(ISECT_BOTTOM) + 26),
-    'East':  (_sx(ISECT_RIGHT)  + 10, SIM_CY + ROAD_WIDTH // 2 + 8),
-    'West':  (_sx(ISECT_LEFT)   - 90, SIM_CY + ROAD_WIDTH // 2 + 8),
+# Vehicle count badge positions
+_BADGE_POS: dict[str, tuple[int, int]] = {
+    'North': (SIM_CX - ROAD_W // 2 - 54, _sy(ISECT_TOP)    - 54),
+    'South': (SIM_CX - ROAD_W // 2 - 54, _sy(ISECT_BOTTOM) + 34),
+    'East':  (_sx(ISECT_RIGHT)  + 14,    SIM_CY + ROAD_W // 2 + 12),
+    'West':  (_sx(ISECT_LEFT)   - 110,   SIM_CY + ROAD_W // 2 + 12),
 }
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-C_BG         = ( 28,  32,  38)
-C_ROAD       = ( 55,  60,  70)
-C_ROAD_EDGE  = ( 42,  47,  56)
-C_ISECT      = ( 48,  53,  63)
-C_LANE_MARK  = (170, 160,  50)
-C_ZEBRA_W    = (210, 210, 210)
-C_ZEBRA_G    = ( 60,  65,  75)
-C_KERB       = ( 88,  94, 106)
-C_PAVEMENT   = ( 72,  78,  88)
-C_GRASS      = ( 34,  52,  34)
-C_PANEL_DIV  = ( 45,  50,  60)
-C_TEXT_MAIN  = (230, 235, 245)
-C_TEXT_DIM   = (120, 130, 148)
-C_TEXT_GREEN = ( 55, 215,  85)
-C_TEXT_YEL   = (240, 200,  40)
-C_TEXT_RED   = (215,  55,  55)
-C_TEXT_CYAN  = ( 55, 215, 215)
-C_HBAR_BG    = ( 40,  45,  55)
-C_CTRL_BG    = ( 18,  21,  28)
-C_BTN_IDLE   = ( 42,  48,  62)
-C_BTN_HOVER  = ( 62,  70,  90)
-C_BTN_ACTIVE = ( 30, 130,  70)
-C_BTN_EMRG   = (140,  25,  25)
-C_BTN_PED    = ( 20,  80, 140)
-C_BTN_ANIMAL = (110,  75,  20)
-C_BTN_SEL    = ( 30, 100, 170)
-C_EMRG_BG   = (150,  18,  18)
-C_PED_BG    = ( 18,  80, 140)
-C_HZRD_BG   = (140,  90,  16)
+# ── Colour palette — BRIGHT THEME ────────────────────────────────────────────
+C_BG           = (232, 236, 245)
+C_PANEL_WHITE  = (255, 255, 255)
+C_PANEL_LIGHT  = (245, 247, 252)
+C_DIVIDER      = (200, 205, 218)
+C_ROAD         = ( 80,  88, 102)
+C_ROAD_KERB    = ( 55,  62,  76)
+C_ISECT        = ( 68,  76,  90)
+C_LANE_MARK    = (220, 205,  60)
+C_ZEBRA        = (225, 228, 235)
+C_GRASS        = ( 82, 148,  66)
+C_PAVEMENT     = (175, 182, 195)
+C_TEXT_DARK    = ( 18,  22,  40)
+C_TEXT_MID     = ( 70,  82, 110)
+C_TEXT_DIM     = (140, 152, 175)
+C_TEXT_WHITE   = (255, 255, 255)
+C_GREEN_TEXT   = ( 18, 158,  65)
+C_YELLOW_TEXT  = (185, 135,   0)
+C_RED_TEXT     = (200,  35,  35)
+C_CYAN_TEXT    = (  0, 148, 190)
+_SIG_GREEN     = ( 34, 197,  94)
+_SIG_YELLOW    = (251, 191,  36)
+_SIG_RED       = (239,  68,  68)
+C_BTN_DEFAULT  = (210, 215, 228)
+C_BTN_HOVER    = (188, 196, 218)
+C_BTN_SEL      = ( 37, 120, 220)
+C_BTN_AUTO_ON  = ( 30, 165,  68)
+C_BTN_EMRG     = (205,  38,  38)
+C_BTN_PED      = ( 37, 100, 200)
+C_BTN_ANIMAL   = (175, 108,  18)
+C_BTN_ZOOM     = (178, 185, 202)
+C_CTRL_BG      = (218, 222, 234)
+C_CTRL_BORDER  = (175, 182, 204)
+C_BANNER_EMRG  = (210,  38,  38)
+C_BANNER_PED   = ( 35,  98, 198)
+C_BANNER_HZRD  = (185, 116,  10)
+C_HUD_BG       = (255, 255, 255)
+C_HUD_BORDER   = (198, 207, 225)
 
-_PHASE_COLORS = {
-    'normal':     C_TEXT_GREEN,
-    'emergency':  C_TEXT_RED,
-    'pedestrian': C_TEXT_CYAN,
-    'all_red':    C_TEXT_RED,
-    'yellow':     C_TEXT_YEL,
+_PHASE_COL = {
+    'normal':     C_GREEN_TEXT,
+    'emergency':  C_RED_TEXT,
+    'pedestrian': C_CYAN_TEXT,
+    'all_red':    C_RED_TEXT,
+    'yellow':     C_YELLOW_TEXT,
     'startup':    C_TEXT_DIM,
 }
 
-# ── Spawn button definitions ───────────────────────────────────────────────────
-# Each dict: label, vehicle class (or special action), key shortcut, colour
+# ── Spawn buttons ─────────────────────────────────────────────────────────────
 _SPAWN_BTNS = [
-    {'label': 'CAR',    'cls': 'car',        'key': 'C', 'color': C_BTN_IDLE},
-    {'label': 'BUS',    'cls': 'bus',        'key': 'B', 'color': C_BTN_IDLE},
-    {'label': 'AUTO',   'cls': 'auto',       'key': 'A', 'color': C_BTN_IDLE},
-    {'label': 'BIKE',   'cls': 'motorcycle', 'key': 'M', 'color': C_BTN_IDLE},
-    {'label': 'PED',    'cls': 'ped',        'key': 'G', 'color': C_BTN_PED},
-    {'label': 'ANIMAL', 'cls': 'animal',     'key': 'V', 'color': C_BTN_ANIMAL},
-    {'label': 'AMBUL',  'cls': 'ambulance',  'key': 'U', 'color': C_BTN_EMRG},
+    {'label': 'CAR',       'cls': 'car',        'key': 'C'},
+    {'label': 'BUS',       'cls': 'bus',        'key': 'B'},
+    {'label': 'AUTO',      'cls': 'auto',       'key': 'A'},
+    {'label': 'BIKE',      'cls': 'motorcycle', 'key': 'M'},
+    {'label': 'PED RUSH',  'cls': 'ped',        'key': 'G'},
+    {'label': 'ANIMAL',    'cls': 'animal',     'key': 'V'},
+    {'label': 'AMBULANCE', 'cls': 'ambulance',  'key': 'U'},
 ]
-
-_ARM_BTNS = ['North', 'South', 'East', 'West']
-
-# Button geometry (within the control panel strip)
-_BTN_W    = 76
-_BTN_H    = 30
-_BTN_GAP  = 6
-_ARM_BTN_W = 52
-_ARM_BTN_H = 24
+_ARM_BTNS  = ['North', 'South', 'East', 'West']
+_BTN_W, _BTN_H, _BTN_GAP = 96, 36, 8
+_ARM_W, _ARM_H             = 64, 28
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 class PygameSimulation:
-    """
-    Upgraded Pygame simulation with interactive control panel and zoom.
-
-    Keyboard shortcuts:
-        Q / ESC   → quit
-        E         → emergency override (North)
-        P         → pedestrian rush
-        C/B/A/M   → spawn car / bus / auto / bike on selected arm
-        G         → spawn pedestrian rush
-        V         → animal hazard on selected arm
-        U         → ambulance override on selected arm
-        TAB       → cycle selected arm (N → S → E → W)
-        1/2/3/4   → force green arm (debug)
-        R         → reset wait times
-        D         → toggle debug overlay
-        S         → save screenshot
-        SPACE     → pause / resume
-        Z / +     → zoom in
-        X / -     → zoom out
-        0         → reset zoom & pan
-    """
+    """Bright-theme 1600×900 interactive traffic simulation."""
 
     def __init__(
         self,
         state: IntersectionState,
         emergency_detector=None,
         title: str = "AI Smart Traffic System — Indian Cities",
+        camera_manager=None,
     ) -> None:
         self._state    = state
         self._emrg_det = emergency_detector
+        self._cam_mgr  = camera_manager
         self._title    = title
-
-        self._screen:  Optional[pygame.Surface] = None
-        self._clock:   Optional[pygame.time.Clock] = None
-        self._fonts:   dict[str, pygame.font.Font] = {}
-
-        self._vehicles = VehicleManager()
-
-        # ── Interaction state ──────────────────────────────────────────────
-        self._selected_arm   = 'North'          # current spawn target arm
-        self._auto_spawn     = False            # auto-spawn toggle
-        self._auto_timer     = 0.0              # accumulator for auto-spawn
-        self._spawn_rate     = 1.0              # vehicles/sec (overridden by control.json)
-        self._sim_speed      = 1.0              # dt multiplier (overridden by control.json)
-        self._debug_overlay  = False
-        self._paused         = False
-        self._running        = True
-        self._screenshot_n   = 0
-        self._frame_count    = 0
-
-        # ── Zoom / pan ────────────────────────────────────────────────────
-        self._zoom            = 1.0             # 0.5 → 2.0
-        self._pan_x           = 0.0             # pixel offset of sim surface
-        self._pan_y           = 0.0
-        self._drag_active     = False
-        self._drag_start: Optional[tuple[int, int]] = None
-        self._drag_pan_start: Optional[tuple[float, float]] = None
-
-        # ── Control panel button rects (computed in _init_pygame) ─────────
-        self._spawn_btn_rects: list[pygame.Rect] = []
-        self._arm_btn_rects:   list[pygame.Rect] = []
-        self._auto_btn_rect:   Optional[pygame.Rect] = None
-        self._zoom_in_rect:    Optional[pygame.Rect] = None
-        self._zoom_out_rect:   Optional[pygame.Rect] = None
-        self._reset_zoom_rect: Optional[pygame.Rect] = None
-
-        # ── FPS tracking ──────────────────────────────────────────────────
-        self._fps_samples:   list[float] = []
-        self._last_fps_time: float = time.time()
-        self._display_fps:   float = 0.0
-
-        # ── Hover state ───────────────────────────────────────────────────
-        self._hover_btn: Optional[int]  = None   # index into _spawn_btn_rects
-        self._hover_arm: Optional[int]  = None   # index into _arm_btn_rects
-
-        # ── Sim surface (zoom target) ─────────────────────────────────────
+        self._screen:   Optional[pygame.Surface] = None
+        self._clock:    Optional[pygame.time.Clock] = None
+        self._fonts:    dict[str, pygame.font.Font] = {}
         self._sim_surf: Optional[pygame.Surface] = None
+        self._vehicles  = VehicleManager()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Entry point
-    # ─────────────────────────────────────────────────────────────────────────
+        self._selected_arm = 'North'
+        self._auto_spawn   = False
+        self._auto_timer   = 0.0
+        self._spawn_rate   = 1.0
+        self._sim_speed    = 1.0
+        self._debug        = False
+        self._paused       = False
+        self._running      = True
+        self._frame_n      = 0
+        self._screenshot_n = 0
+
+        self._zoom   = 1.0
+        self._pan_x  = 0.0
+        self._pan_y  = 0.0
+        self._dragging     = False
+        self._drag_origin: Optional[tuple[int, int]]    = None
+        self._drag_pan0:   Optional[tuple[float, float]] = None
+
+        self._arm_rects:     list[pygame.Rect] = []
+        self._spawn_rects:   list[pygame.Rect] = []
+        self._auto_rect:     Optional[pygame.Rect] = None
+        self._zoom_in_rect:  Optional[pygame.Rect] = None
+        self._zoom_out_rect: Optional[pygame.Rect] = None
+        self._zoom_rst_rect: Optional[pygame.Rect] = None
+        self._hover_spawn: Optional[int] = None
+        self._hover_arm:   Optional[int] = None
+
+        self._fps_buf:  list[float] = []
+        self._fps_t:    float = time.time()
+        self._fps_disp: float = 0.0
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         self._init_pygame()
-        logger.info("Pygame simulation started — %dx%d @ %d FPS", WIN_W, WIN_H, SIM_FPS)
-
+        logger.info("Pygame simulation started %dx%d @%dfps", WIN_W, WIN_H, SIM_FPS)
         while self._running:
-            dt = self._clock.tick(SIM_FPS) / 1000.0
-            dt = min(dt, 0.1) * self._sim_speed
-
+            raw_dt = self._clock.tick(SIM_FPS) / 1000.0
+            dt     = min(raw_dt, 0.1) * self._sim_speed
             self._handle_events()
-
             if not self._paused:
                 self._update(dt)
-
             self._draw()
             pygame.display.flip()
-            self._frame_count += 1
-
+            self._frame_n += 1
         pygame.quit()
         logger.info("Pygame simulation stopped")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Init
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Init ──────────────────────────────────────────────────────────────────
 
     def _init_pygame(self) -> None:
+        """
+        Fixed _init_pygame that auto-scales window to display resolution.
+        1600×900 is ideal but many laptops are 1366×768 or 1280×720.
+        Scales down to 90% of available display if needed.
+        """
         pygame.init()
         pygame.display.set_caption(self._title)
-        self._screen   = pygame.display.set_mode((WIN_W, WIN_H))
-        self._sim_surf = pygame.Surface((SIM_PANEL_W, SIM_DRAW_H))
+
+        # Auto-detect display size
+        info = pygame.display.Info()
+        screen_w = info.current_w
+        screen_h = info.current_h
+
+        # Target 1600×900 but cap at 90% of screen
+        target_w, target_h = 1600, 900
+        max_w = int(screen_w * 0.92)
+        max_h = int(screen_h * 0.92)
+
+        actual_w = min(target_w, max_w)
+        actual_h = min(target_h, max_h)
+
+        # Maintain 16:9 ratio — scale down proportionally if needed
+        if actual_w / actual_h > 16 / 9:
+            actual_w = int(actual_h * 16 / 9)
+        else:
+            actual_h = int(actual_w * 9 / 16)
+
+        # Update module-level globals — these are used by all draw functions
+        import simulation.pygame_sim as _mod
+        _mod.WIN_W       = actual_w
+        _mod.WIN_H       = actual_h
+        _mod.SIM_PANEL_W = int(actual_w * 0.6125)   # ~980/1600
+        _mod.CTRL_H      = int(actual_h * 0.122)    # ~110/900
+        _mod.SIM_DRAW_H  = actual_h - _mod.CTRL_H
+        _mod.CAM_PANEL_X = _mod.SIM_PANEL_W
+        _mod.CAM_PANEL_W = actual_w - _mod.SIM_PANEL_W
+        _mod.SIM_CX      = _mod.SIM_PANEL_W // 2
+        _mod.SIM_CY      = _mod.SIM_DRAW_H  // 2
+
+        self._screen   = pygame.display.set_mode((actual_w, actual_h))
+        self._sim_surf = pygame.Surface((_mod.SIM_PANEL_W, _mod.SIM_DRAW_H))
         self._clock    = pygame.time.Clock()
 
+        # Font sizes scaled to window
+        scale = actual_h / 900.0
+        def _fs(n): return max(9, int(n * scale))
+
         self._fonts = {
-            'sm':    pygame.font.SysFont('monospace', 11),
-            'md':    pygame.font.SysFont('monospace', 13),
-            'lg':    pygame.font.SysFont('monospace', 16),
-            'xl':    pygame.font.SysFont('monospace', 21, bold=True),
-            'title': pygame.font.SysFont('monospace', 10),
-            'btn':   pygame.font.SysFont('monospace', 11, bold=True),
+            'xs':      pygame.font.SysFont('segoeui',   _fs(11)),
+            'sm':      pygame.font.SysFont('segoeui',   _fs(13)),
+            'md':      pygame.font.SysFont('segoeui',   _fs(15)),
+            'lg':      pygame.font.SysFont('segoeui',   _fs(18), bold=True),
+            'xl':      pygame.font.SysFont('segoeui',   _fs(24), bold=True),
+            'xxl':     pygame.font.SysFont('segoeui',   _fs(32), bold=True),
+            'btn':     pygame.font.SysFont('segoeui',   _fs(13), bold=True),
+            'mono':    pygame.font.SysFont('monospace', _fs(13)),
+            'mono_sm': pygame.font.SysFont('monospace', _fs(11)),
         }
+        self._build_rects()
 
-        self._build_button_rects()
+    def _build_rects(self) -> None:
+        ctrl_top = SIM_DRAW_H
+        r1_y  = ctrl_top + 10
+        arm_x = 10
+        self._arm_rects = [
+            pygame.Rect(arm_x + i * (_ARM_W + 6), r1_y, _ARM_W, _ARM_H)
+            for i in range(len(_ARM_BTNS))
+        ]
+        x = arm_x + len(_ARM_BTNS) * (_ARM_W + 6) + 18
+        self._auto_rect     = pygame.Rect(x,       r1_y, 110, _ARM_H)
+        x += 118
+        self._zoom_in_rect  = pygame.Rect(x,       r1_y, 44, _ARM_H)
+        self._zoom_out_rect = pygame.Rect(x + 48,  r1_y, 44, _ARM_H)
+        self._zoom_rst_rect = pygame.Rect(x + 96,  r1_y, 44, _ARM_H)
+        r2_y = ctrl_top + _ARM_H + 18
+        self._spawn_rects = [
+            pygame.Rect(10 + i * (_BTN_W + _BTN_GAP), r2_y, _BTN_W, _BTN_H)
+            for i in range(len(_SPAWN_BTNS))
+        ]
 
-    def _build_button_rects(self) -> None:
-        """Compute all clickable rects for the control panel."""
-        panel_y = SIM_DRAW_H    # y of control panel top inside window
-
-        # ── Row 1: Arm selector (N S E W) at top of panel ─────────────────
-        arm_row_y = panel_y + 8
-        arm_total_w = len(_ARM_BTNS) * _ARM_BTN_W + (len(_ARM_BTNS) - 1) * 4
-        arm_start_x = 8
-
-        self._arm_btn_rects = []
-        for i in range(len(_ARM_BTNS)):
-            x = arm_start_x + i * (_ARM_BTN_W + 4)
-            self._arm_btn_rects.append(
-                pygame.Rect(x, arm_row_y, _ARM_BTN_W, _ARM_BTN_H)
-            )
-
-        # ── Row 1 right side: AUTO + ZOOM controls ─────────────────────────
-        ctrl_x = arm_start_x + arm_total_w + 16
-
-        self._auto_btn_rect = pygame.Rect(ctrl_x, arm_row_y, 80, _ARM_BTN_H)
-        ctrl_x += 86
-        self._zoom_in_rect  = pygame.Rect(ctrl_x,      arm_row_y, 34, _ARM_BTN_H)
-        self._zoom_out_rect = pygame.Rect(ctrl_x + 38, arm_row_y, 34, _ARM_BTN_H)
-        self._reset_zoom_rect = pygame.Rect(ctrl_x + 76, arm_row_y, 34, _ARM_BTN_H)
-
-        # ── Row 2: Spawn buttons ───────────────────────────────────────────
-        btn_row_y = panel_y + _ARM_BTN_H + 14
-        self._spawn_btn_rects = []
-        for i in range(len(_SPAWN_BTNS)):
-            x = 8 + i * (_BTN_W + _BTN_GAP)
-            self._spawn_btn_rects.append(
-                pygame.Rect(x, btn_row_y, _BTN_W, _BTN_H)
-            )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Event handling
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Events ────────────────────────────────────────────────────────────────
 
     def _handle_events(self) -> None:
-        mouse_pos = pygame.mouse.get_pos()
-        self._hover_btn = None
-        self._hover_arm = None
-
-        # Update hover state
-        for i, r in enumerate(self._spawn_btn_rects):
-            if r.collidepoint(mouse_pos):
-                self._hover_btn = i
-        for i, r in enumerate(self._arm_btn_rects):
-            if r.collidepoint(mouse_pos):
-                self._hover_arm = i
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self._quit()
-
-            elif event.type == pygame.KEYDOWN:
-                self._handle_key(event.key)
-
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                self._handle_mouse_down(event.button, event.pos)
-
-            elif event.type == pygame.MOUSEBUTTONUP:
-                if event.button == 2:   # middle click release
-                    self._drag_active = False
-
-            elif event.type == pygame.MOUSEMOTION:
-                if self._drag_active and self._drag_start:
-                    dx = event.pos[0] - self._drag_start[0]
-                    dy = event.pos[1] - self._drag_start[1]
-                    self._pan_x = self._drag_pan_start[0] + dx
-                    self._pan_y = self._drag_pan_start[1] + dy
+        mp = pygame.mouse.get_pos()
+        self._hover_spawn = next((i for i, r in enumerate(self._spawn_rects) if r.collidepoint(mp)), None)
+        self._hover_arm   = next((i for i, r in enumerate(self._arm_rects)   if r.collidepoint(mp)), None)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:                 self._quit()
+            elif ev.type == pygame.KEYDOWN:            self._on_key(ev.key)
+            elif ev.type == pygame.MOUSEBUTTONDOWN:    self._on_click(ev.button, ev.pos)
+            elif ev.type == pygame.MOUSEBUTTONUP:
+                if ev.button == 2: self._dragging = False
+            elif ev.type == pygame.MOUSEMOTION:
+                if self._dragging and self._drag_origin:
+                    dx = ev.pos[0] - self._drag_origin[0]
+                    dy = ev.pos[1] - self._drag_origin[1]
+                    self._pan_x = self._drag_pan0[0] + dx
+                    self._pan_y = self._drag_pan0[1] + dy
                     self._clamp_pan()
 
-    def _handle_mouse_down(self, button: int, pos: tuple[int, int]) -> None:
-        # ── Scroll wheel zoom ─────────────────────────────────────────────
-        if button == 4:   # scroll up → zoom in
-            self._adjust_zoom(+0.1, pos)
+    def _on_click(self, btn: int, pos: tuple[int, int]) -> None:
+        mid = (SIM_PANEL_W // 2, SIM_DRAW_H // 2)
+        if btn == 4:   self._zoom_by(+0.12, pos);  return
+        if btn == 5:   self._zoom_by(-0.12, pos);  return
+        if btn == 2:
+            self._dragging = True
+            self._drag_origin = pos
+            self._drag_pan0   = (self._pan_x, self._pan_y)
             return
-        if button == 5:   # scroll down → zoom out
-            self._adjust_zoom(-0.1, pos)
-            return
+        if btn != 1: return
+        for i, r in enumerate(self._spawn_rects):
+            if r.collidepoint(pos): self._do_spawn(_SPAWN_BTNS[i]['cls']); return
+        for i, r in enumerate(self._arm_rects):
+            if r.collidepoint(pos): self._selected_arm = _ARM_BTNS[i]; return
+        if self._auto_rect     and self._auto_rect.collidepoint(pos):
+            self._auto_spawn = not self._auto_spawn; return
+        if self._zoom_in_rect  and self._zoom_in_rect.collidepoint(pos):
+            self._zoom_by(+0.2, mid); return
+        if self._zoom_out_rect and self._zoom_out_rect.collidepoint(pos):
+            self._zoom_by(-0.2, mid); return
+        if self._zoom_rst_rect and self._zoom_rst_rect.collidepoint(pos):
+            self._zoom = 1.0; self._pan_x = self._pan_y = 0.0
 
-        # ── Middle drag (pan) ─────────────────────────────────────────────
-        if button == 2:
-            self._drag_active    = True
-            self._drag_start     = pos
-            self._drag_pan_start = (self._pan_x, self._pan_y)
-            return
+    def _on_key(self, key: int) -> None:
+        mid = (SIM_PANEL_W // 2, SIM_DRAW_H // 2)
+        binds = {
+            pygame.K_q:      lambda: self._quit(),
+            pygame.K_ESCAPE: lambda: self._quit(),
+            pygame.K_e:      lambda: self._do_spawn('ambulance', 'North'),
+            pygame.K_p:      lambda: self._do_spawn('ped'),
+            pygame.K_c:      lambda: self._do_spawn('car'),
+            pygame.K_b:      lambda: self._do_spawn('bus'),
+            pygame.K_a:      lambda: self._do_spawn('auto'),
+            pygame.K_m:      lambda: self._do_spawn('motorcycle'),
+            pygame.K_g:      lambda: self._do_spawn('ped'),
+            pygame.K_v:      lambda: self._do_spawn('animal'),
+            pygame.K_u:      lambda: self._do_spawn('ambulance'),
+            pygame.K_TAB:    lambda: self._cycle_arm(),
+            pygame.K_d:      lambda: setattr(self, '_debug', not self._debug),
+            pygame.K_SPACE:  lambda: setattr(self, '_paused', not self._paused),
+            pygame.K_r:      lambda: self._reset_waits(),
+            pygame.K_s:      lambda: self._screenshot(),
+            pygame.K_1:      lambda: self._force_green('North'),
+            pygame.K_2:      lambda: self._force_green('South'),
+            pygame.K_3:      lambda: self._force_green('East'),
+            pygame.K_4:      lambda: self._force_green('West'),
+            pygame.K_0:      lambda: self._reset_zoom(),
+            pygame.K_z:      lambda: self._zoom_by(+0.15, mid),
+            pygame.K_PLUS:   lambda: self._zoom_by(+0.15, mid),
+            pygame.K_EQUALS: lambda: self._zoom_by(+0.15, mid),
+            pygame.K_x:      lambda: self._zoom_by(-0.15, mid),
+            pygame.K_MINUS:  lambda: self._zoom_by(-0.15, mid),
+        }
+        fn = binds.get(key)
+        if fn: fn()
 
-        if button != 1:   # only left click from here
-            return
+    # ── Actions ───────────────────────────────────────────────────────────────
 
-        # ── Spawn buttons ─────────────────────────────────────────────────
-        for i, r in enumerate(self._spawn_btn_rects):
-            if r.collidepoint(pos):
-                self._trigger_spawn(_SPAWN_BTNS[i]['cls'])
-                return
-
-        # ── Arm selector ──────────────────────────────────────────────────
-        for i, r in enumerate(self._arm_btn_rects):
-            if r.collidepoint(pos):
-                self._selected_arm = _ARM_BTNS[i]
-                return
-
-        # ── Auto spawn toggle ─────────────────────────────────────────────
-        if self._auto_btn_rect and self._auto_btn_rect.collidepoint(pos):
-            self._auto_spawn = not self._auto_spawn
-            logger.info("[CTRL] Auto-spawn: %s", "ON" if self._auto_spawn else "OFF")
-            return
-
-        # ── Zoom buttons ──────────────────────────────────────────────────
-        if self._zoom_in_rect and self._zoom_in_rect.collidepoint(pos):
-            self._adjust_zoom(+0.2, (SIM_PANEL_W // 2, SIM_DRAW_H // 2))
-        elif self._zoom_out_rect and self._zoom_out_rect.collidepoint(pos):
-            self._adjust_zoom(-0.2, (SIM_PANEL_W // 2, SIM_DRAW_H // 2))
-        elif self._reset_zoom_rect and self._reset_zoom_rect.collidepoint(pos):
-            self._zoom = 1.0
-            self._pan_x = 0.0
-            self._pan_y = 0.0
-
-    def _handle_key(self, key: int) -> None:
-        if key in (pygame.K_q, pygame.K_ESCAPE):
-            self._quit()
-        elif key == pygame.K_e:
-            self._trigger_spawn('ambulance', arm='North')
-        elif key == pygame.K_p:
-            self._trigger_spawn('ped')
-        elif key == pygame.K_c:
-            self._trigger_spawn('car')
-        elif key == pygame.K_b:
-            self._trigger_spawn('bus')
-        elif key == pygame.K_a:
-            self._trigger_spawn('auto')
-        elif key == pygame.K_m:
-            self._trigger_spawn('motorcycle')
-        elif key == pygame.K_g:
-            self._trigger_spawn('ped')
-        elif key == pygame.K_v:
-            self._trigger_spawn('animal')
-        elif key == pygame.K_u:
-            self._trigger_spawn('ambulance')
-        elif key == pygame.K_TAB:
-            idx = _ARM_BTNS.index(self._selected_arm)
-            self._selected_arm = _ARM_BTNS[(idx + 1) % len(_ARM_BTNS)]
-        elif key == pygame.K_d:
-            self._debug_overlay = not self._debug_overlay
-        elif key == pygame.K_SPACE:
-            self._paused = not self._paused
-        elif key == pygame.K_r:
-            with self._state.lock:
-                for arm in self._state.arms.values():
-                    arm.wait_time = 0.0
-        elif key == pygame.K_s:
-            self._save_screenshot()
-        elif key in (pygame.K_z, pygame.K_PLUS, pygame.K_EQUALS):
-            self._adjust_zoom(+0.15, (SIM_PANEL_W // 2, SIM_DRAW_H // 2))
-        elif key in (pygame.K_x, pygame.K_MINUS):
-            self._adjust_zoom(-0.15, (SIM_PANEL_W // 2, SIM_DRAW_H // 2))
-        elif key == pygame.K_0:
-            self._zoom = 1.0; self._pan_x = 0.0; self._pan_y = 0.0
-        elif key == pygame.K_1:
-            self._force_green('North')
-        elif key == pygame.K_2:
-            self._force_green('South')
-        elif key == pygame.K_3:
-            self._force_green('East')
-        elif key == pygame.K_4:
-            self._force_green('West')
-
-    def _trigger_spawn(self, cls: str, arm: Optional[str] = None) -> None:
-        """Route a spawn action to the right handler."""
+    def _do_spawn(self, cls: str, arm: Optional[str] = None) -> None:
         target = arm or self._selected_arm
-
         if cls == 'ped':
-            if self._emrg_det:
-                self._emrg_det.simulate_ped_rush()
-            logger.info("[SPAWN] Pedestrian rush triggered")
-
+            if self._emrg_det: self._emrg_det.simulate_ped_rush()
         elif cls == 'ambulance':
-            if self._emrg_det:
-                self._emrg_det.simulate_emergency(target)
-            logger.info("[SPAWN] Emergency on %s", target)
-
+            if self._emrg_det: self._emrg_det.simulate_emergency(target)
         elif cls == 'animal':
-            # Set hazard flag on arm state directly (cleared by EmergencyDetector countdown)
             try:
                 with self._state.lock:
                     self._state.arms[target].hazard = True
-            except (AttributeError, KeyError):
-                pass
-            logger.info("[SPAWN] Animal hazard on %s", target)
-
+            except Exception: pass
         else:
-            # Normal vehicle — inject directly into queue
-            self._manual_spawn(cls, target)
-
-    def _manual_spawn(self, cls: str, arm: str) -> None:
-        """Create one vehicle of a specific class at the arm spawn point."""
-        queue = self._vehicles.queues.get(arm)
-        if queue is None or len(queue.vehicles) >= MAX_VEHICLES_PER_ARM:
-            return
-
-        sx, sy = SPAWN_POSITIONS[arm]
-        jitter = random.uniform(-5, 5)
-        if arm in ('North', 'South'):
-            sx += jitter
-        else:
-            sy += jitter
-
-        v = Vehicle(arm=arm, cls=cls, x=float(sx), y=float(sy))
-        queue.vehicles.append(v)
-        logger.debug("[SPAWN] %s on %s arm", cls, arm)
+            q = self._vehicles.queues.get(target)
+            if q and len(q.vehicles) < MAX_VEHICLES_PER_ARM:
+                sx, sy = SPAWN_POSITIONS[target]
+                jit = random.uniform(-6, 6)
+                if target in ('North', 'South'): sx += jit
+                else:                             sy += jit
+                q.vehicles.append(Vehicle(arm=target, cls=cls, x=float(sx), y=float(sy)))
 
     def _force_green(self, arm: str) -> None:
         with self._state.lock:
-            self._state.set_signal(None, 'RED')
-            self._state.set_signal(arm, 'GREEN')
+            for a in self._state.arms.values():
+                a.signal_state = 'RED'
+            if arm in self._state.arms:
+                self._state.arms[arm].signal_state = 'GREEN'
             self._state.current_green = arm
             self._state.phase = 'normal'
+            self._state._update_arm_signals_locked(arm, 'green')
 
-    def _quit(self) -> None:
-        self._running = False
+    def _cycle_arm(self) -> None:
+        idx = _ARM_BTNS.index(self._selected_arm)
+        self._selected_arm = _ARM_BTNS[(idx + 1) % len(_ARM_BTNS)]
+
+    def _reset_waits(self) -> None:
         with self._state.lock:
-            self._state.running = False
+            for arm in self._state.arms.values():
+                arm.wait_time = 0.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Zoom helpers
-    # ─────────────────────────────────────────────────────────────────────────
+    def _reset_zoom(self) -> None:
+        self._zoom = 1.0; self._pan_x = self._pan_y = 0.0
 
-    def _adjust_zoom(self, delta: float, anchor: tuple[int, int]) -> None:
-        """Zoom toward/away from anchor point (screen coords in sim panel)."""
-        old_zoom = self._zoom
-        self._zoom = max(0.5, min(2.5, self._zoom + delta))
-
-        # Adjust pan so anchor pixel stays fixed
+    def _zoom_by(self, delta: float, anchor: tuple[int, int]) -> None:
+        old = self._zoom
+        self._zoom = max(0.4, min(3.0, self._zoom + delta))
         ax, ay = anchor
-        ratio   = self._zoom / old_zoom
-        self._pan_x = ax - ratio * (ax - self._pan_x)
-        self._pan_y = ay - ratio * (ay - self._pan_y)
+        r = self._zoom / old
+        self._pan_x = ax - r * (ax - self._pan_x)
+        self._pan_y = ay - r * (ay - self._pan_y)
         self._clamp_pan()
 
     def _clamp_pan(self) -> None:
-        """Prevent panning the sim surface entirely off-screen."""
-        scaled_w = SIM_PANEL_W * self._zoom
-        scaled_h = SIM_DRAW_H  * self._zoom
-        self._pan_x = max(min(self._pan_x, SIM_PANEL_W * 0.5),
-                          SIM_PANEL_W - scaled_w - SIM_PANEL_W * 0.5)
-        self._pan_y = max(min(self._pan_y, SIM_DRAW_H  * 0.5),
-                          SIM_DRAW_H  - scaled_h - SIM_DRAW_H  * 0.5)
+        sw = SIM_PANEL_W * self._zoom;  sh = SIM_DRAW_H * self._zoom
+        self._pan_x = max(min(self._pan_x, SIM_PANEL_W * 0.5), SIM_PANEL_W - sw - SIM_PANEL_W * 0.5)
+        self._pan_y = max(min(self._pan_y, SIM_DRAW_H  * 0.5), SIM_DRAW_H  - sh - SIM_DRAW_H  * 0.5)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Update
-    # ─────────────────────────────────────────────────────────────────────────
+    def _quit(self) -> None:
+        self._running = False
+        with self._state.lock: self._state.running = False
+
+    def _screenshot(self) -> None:
+        self._screenshot_n += 1
+        fname = f"screenshot_{self._screenshot_n:03d}.png"
+        pygame.image.save(self._screen, fname)
+        logger.info("Screenshot: %s", fname)
+
+    # ── Update ────────────────────────────────────────────────────────────────
 
     def _update(self, dt: float) -> None:
-        arm_snapshot = self._state.snapshot_arms()
-        self._vehicles.update(arm_snapshot, dt)
-
-        # Auto-spawn
+        self._vehicles.update(self._state.snapshot_arms(), dt)
         if self._auto_spawn:
             self._auto_timer += dt
-            interval = 1.0 / max(self._spawn_rate, 0.1)
-            while self._auto_timer >= interval:
-                self._auto_timer -= interval
-                arm = random.choice(ARM_NAMES)
-                cls = _random_vehicle_class()
-                self._manual_spawn(cls, arm)
-
-        # File polling (every 60 frames ≈ 2s)
-        if self._frame_count % 60 == 0:
-            self._poll_control_file()
-
-        # Spawn command from Streamlit sidebar (every frame — one-shot file)
-        self._poll_spawn_file()
-
-        # FPS
+            iv = 1.0 / max(self._spawn_rate, 0.1)
+            while self._auto_timer >= iv:
+                self._auto_timer -= iv
+                self._do_spawn(_random_vehicle_class(), random.choice(ARM_NAMES))
+        if self._frame_n % 60 == 0: self._poll_control()
+        self._poll_spawn()
         now = time.time()
-        self._fps_samples.append(1.0 / max(dt / max(self._sim_speed, 0.01), 0.001))
-        if now - self._last_fps_time >= 1.0:
-            self._display_fps = (
-                sum(self._fps_samples) / max(len(self._fps_samples), 1)
-            )
-            self._fps_samples.clear()
-            self._last_fps_time = now
+        self._fps_buf.append(1.0 / max(dt / max(self._sim_speed, 0.01), 0.001))
+        if now - self._fps_t >= 1.0:
+            self._fps_disp = sum(self._fps_buf) / max(len(self._fps_buf), 1)
+            self._fps_buf.clear(); self._fps_t = now
 
-    def _poll_control_file(self) -> None:
+    def _poll_control(self) -> None:
         try:
-            ctrl = json.loads(_CONTROL_FILE.read_text())
-            self._spawn_rate = float(ctrl.get('spawn_rate', 1.0))
-            self._sim_speed  = float(ctrl.get('sim_speed',  1.0))
-        except Exception:
-            pass
+            c = json.loads(_CONTROL_FILE.read_text())
+            self._spawn_rate = float(c.get('spawn_rate', 1.0))
+            self._sim_speed  = float(c.get('sim_speed',  1.0))
+        except Exception: pass
 
-    def _poll_spawn_file(self) -> None:
-        if not _SPAWN_FILE.exists():
-            return
+    def _poll_spawn(self) -> None:
+        if not _SPAWN_FILE.exists(): return
         try:
-            cmd = json.loads(_SPAWN_FILE.read_text())
+            c = json.loads(_SPAWN_FILE.read_text())
             _SPAWN_FILE.unlink(missing_ok=True)
-            cls = cmd.get('type', 'car')
-            arm = cmd.get('arm', self._selected_arm)
-            self._trigger_spawn(cls, arm)
-        except Exception:
-            pass
+            self._do_spawn(c.get('type', 'car'), c.get('arm', self._selected_arm))
+        except Exception: pass
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Draw — top level
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Draw top-level ────────────────────────────────────────────────────────
 
     def _draw(self) -> None:
         self._screen.fill(C_BG)
 
-        # Render intersection to _sim_surf, then zoom+blit to screen
         self._sim_surf.fill(C_BG)
         self._draw_intersection(self._sim_surf)
 
         if self._zoom == 1.0 and self._pan_x == 0.0 and self._pan_y == 0.0:
             self._screen.blit(self._sim_surf, (0, 0))
         else:
-            scaled_w = int(SIM_PANEL_W * self._zoom)
-            scaled_h = int(SIM_DRAW_H  * self._zoom)
-            scaled   = pygame.transform.scale(self._sim_surf, (scaled_w, scaled_h))
-            # Clip to sim panel area
-            clip_rect = pygame.Rect(0, 0, SIM_PANEL_W, SIM_DRAW_H)
-            self._screen.set_clip(clip_rect)
+            sw = int(SIM_PANEL_W * self._zoom)
+            sh = int(SIM_DRAW_H  * self._zoom)
+            scaled = pygame.transform.scale(self._sim_surf, (sw, sh))
+            self._screen.set_clip(pygame.Rect(0, 0, SIM_PANEL_W, SIM_DRAW_H))
             self._screen.blit(scaled, (int(self._pan_x), int(self._pan_y)))
             self._screen.set_clip(None)
 
-        # Control panel (never zoomed — stays anchored to bottom)
-        self._draw_control_panel()
-
-        # Camera panel (right side)
+        self._draw_control_strip()
         self._draw_camera_panel()
+        pygame.draw.line(self._screen, C_DIVIDER, (SIM_PANEL_W, 0), (SIM_PANEL_W, WIN_H), 2)
+        if self._paused: self._draw_pause_overlay()
 
-        # Divider
-        pygame.draw.line(
-            self._screen, C_PANEL_DIV,
-            (SIM_PANEL_W, 0), (SIM_PANEL_W, WIN_H), 2
-        )
-
-        if self._paused:
-            self._draw_pause_overlay()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Intersection drawing  (renders into _sim_surf at 1:1 scale)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Intersection (onto _sim_surf) ─────────────────────────────────────────
 
     def _draw_intersection(self, surf: pygame.Surface) -> None:
-        # ── Grass / pavement corners ──────────────────────────────────────
-        road_l = SIM_CX - ROAD_WIDTH // 2
-        road_r = SIM_CX + ROAD_WIDTH // 2
-        road_t = SIM_CY - ROAD_WIDTH // 2
-        road_b = SIM_CY + ROAD_WIDTH // 2
+        rl = SIM_CX - ROAD_W // 2;  rr = SIM_CX + ROAD_W // 2
+        rt = SIM_CY - ROAD_W // 2;  rb = SIM_CY + ROAD_W // 2
+        ix = _sx(ISECT_LEFT);  iy = _sy(ISECT_TOP)
+        iw = _sx(ISECT_RIGHT) - ix;  ih = _sy(ISECT_BOTTOM) - iy
 
-        corners = [
-            (0,      0,      road_l,      road_t),    # top-left
-            (road_r, 0,      SIM_PANEL_W - road_r, road_t),  # top-right
-            (0,      road_b, road_l,      SIM_DRAW_H - road_b),  # bot-left
-            (road_r, road_b, SIM_PANEL_W - road_r, SIM_DRAW_H - road_b),  # bot-right
-        ]
-        for rx, ry, rw, rh in corners:
-            pygame.draw.rect(surf, C_GRASS, (rx, ry, rw, rh))
+        # Grass corners
+        for gx, gy, gw, gh in [(0, 0, rl, rt), (rr, 0, SIM_PANEL_W - rr, rt),
+                                 (0, rb, rl, SIM_DRAW_H - rb), (rr, rb, SIM_PANEL_W - rr, SIM_DRAW_H - rb)]:
+            pygame.draw.rect(surf, C_GRASS, (gx, gy, gw, gh))
+        # Pavement strips beside road
+        for px, py, pw, ph in [(rl - 9, 0, 9, SIM_DRAW_H), (rr, 0, 9, SIM_DRAW_H),
+                                 (0, rt - 9, SIM_PANEL_W, 9), (0, rb, SIM_PANEL_W, 9)]:
+            pygame.draw.rect(surf, C_PAVEMENT, (px, py, pw, ph))
 
-        # ── Road arms ─────────────────────────────────────────────────────
-        pygame.draw.rect(surf, C_ROAD, (road_l, 0, ROAD_WIDTH, SIM_DRAW_H))
-        pygame.draw.rect(surf, C_ROAD, (0, road_t, SIM_PANEL_W, ROAD_WIDTH))
+        # Road
+        pygame.draw.rect(surf, C_ROAD, (rl, 0,  ROAD_W, SIM_DRAW_H))
+        pygame.draw.rect(surf, C_ROAD, (0,  rt, SIM_PANEL_W, ROAD_W))
+        for x in (rl, rr): pygame.draw.line(surf, C_ROAD_KERB, (x, 0), (x, SIM_DRAW_H), 3)
+        for y in (rt, rb): pygame.draw.line(surf, C_ROAD_KERB, (0, y), (SIM_PANEL_W, y), 3)
 
-        # Kerb edges
-        for x in (road_l, road_r):
-            pygame.draw.line(surf, C_KERB, (x, 0), (x, SIM_DRAW_H), 2)
-        for y in (road_t, road_b):
-            pygame.draw.line(surf, C_KERB, (0, y), (SIM_PANEL_W, y), 2)
+        # Intersection box
+        pygame.draw.rect(surf, C_ISECT,    (ix, iy, iw, ih))
+        pygame.draw.rect(surf, C_ROAD_KERB,(ix, iy, iw, ih), 2)
 
-        # ── Intersection box ──────────────────────────────────────────────
-        isect_x = _sx(ISECT_LEFT)
-        isect_y = _sy(ISECT_TOP)
-        isect_w = _sx(ISECT_RIGHT)  - isect_x
-        isect_h = _sy(ISECT_BOTTOM) - isect_y
-        pygame.draw.rect(surf, C_ISECT, (isect_x, isect_y, isect_w, isect_h))
-        pygame.draw.rect(surf, C_KERB,  (isect_x, isect_y, isect_w, isect_h), 1)
+        # Dashed centre lines
+        _dash(surf, C_LANE_MARK, (SIM_CX, 0),        (SIM_CX, iy - 1),         14, 8, 2)
+        _dash(surf, C_LANE_MARK, (SIM_CX, iy + ih + 1), (SIM_CX, SIM_DRAW_H),  14, 8, 2)
+        _dash(surf, C_LANE_MARK, (0, SIM_CY),        (ix - 1, SIM_CY),         14, 8, 2)
+        _dash(surf, C_LANE_MARK, (ix + iw + 1, SIM_CY), (SIM_PANEL_W, SIM_CY), 14, 8, 2)
 
-        # ── Dashed centre lines (outside intersection) ────────────────────
-        _draw_dashed_line(surf, C_LANE_MARK, (SIM_CX, 0), (SIM_CX, isect_y - 1), 12, 7)
-        _draw_dashed_line(surf, C_LANE_MARK, (SIM_CX, isect_y + isect_h + 1), (SIM_CX, SIM_DRAW_H), 12, 7)
-        _draw_dashed_line(surf, C_LANE_MARK, (0, SIM_CY), (isect_x - 1, SIM_CY), 12, 7)
-        _draw_dashed_line(surf, C_LANE_MARK, (isect_x + isect_w + 1, SIM_CY), (SIM_PANEL_W, SIM_CY), 12, 7)
+        # Zebra crossings
+        S, G, D = 6, 5, 22
+        for y0 in (iy - D, iy + ih):
+            x = rl
+            while x < rr:
+                pygame.draw.rect(surf, C_ZEBRA, (x, y0, S, D)); x += S + G
+        for x0 in (ix - D, ix + iw):
+            y = rt
+            while y < rb:
+                pygame.draw.rect(surf, C_ZEBRA, (x0, y, D, S)); y += S + G
 
-        # ── Zebra crossings ───────────────────────────────────────────────
-        self._draw_zebra_crossings(surf)
+        # Direction arrows
+        C_ARR = (100, 108, 125)
+        _arrow(surf, C_ARR, (SIM_CX, iy - 70),     (SIM_CX, iy - 38),     12)
+        _arrow(surf, C_ARR, (SIM_CX, iy + ih + 70),(SIM_CX, iy + ih + 38),12)
+        _arrow(surf, C_ARR, (ix + iw + 70, SIM_CY),(ix + iw + 38, SIM_CY),12)
+        _arrow(surf, C_ARR, (ix - 70, SIM_CY),     (ix - 38, SIM_CY),     12)
 
-        # ── Direction arrows ──────────────────────────────────────────────
-        self._draw_direction_arrows(surf)
-
-        # ── Stop lines + signal colours ───────────────────────────────────
+        # Stop lines
         with self._state.lock:
-            signals = {name: arm.signal for name, arm in self._state.arms.items()}
-
-        for arm, sig in signals.items():
-            color = (SIM_COLOR_GREEN if sig == 'GREEN' else
-                     SIM_COLOR_YELLOW if sig == 'YELLOW' else SIM_COLOR_RED)
-            stop  = STOP_LINES[arm]
+            sigs = {n: a.signal_state for n, a in self._state.arms.items()}
+        for arm, sig in sigs.items():
+            col  = _SIG_GREEN if sig == 'GREEN' else (_SIG_YELLOW if sig == 'YELLOW' else _SIG_RED)
+            stop = STOP_LINES[arm]
             if arm in ('North', 'South'):
                 sy_ = _sy(stop)
-                pygame.draw.line(surf, color,
-                                 (road_l, sy_), (road_r, sy_), 3)
+                pygame.draw.line(surf, col, (rl, sy_), (rr, sy_), 4)
             else:
                 sx_ = _sx(stop)
-                pygame.draw.line(surf, color,
-                                 (sx_, road_t), (sx_, road_b), 3)
+                pygame.draw.line(surf, col, (sx_, rt), (sx_, rb), 4)
 
-        # ── Vehicles ──────────────────────────────────────────────────────
+        # Vehicles
         for v in self._vehicles.all_vehicles():
             rx, ry, rw, rh = v.rect
-            vr = pygame.Rect(_sx(rx), _sy(ry), max(4, _sv(rw)), max(6, _sv(rh)))
-            pygame.draw.rect(surf, v.color, vr, border_radius=2)
-            pygame.draw.rect(surf, (0, 0, 0), vr, 1, border_radius=2)
+            vr = pygame.Rect(_sx(rx), _sy(ry), max(5, _sv(rw)), max(7, _sv(rh)))
+            pygame.draw.rect(surf, v.color, vr, border_radius=3)
+            pygame.draw.rect(surf, (0, 0, 0), vr, 1, border_radius=3)
 
-        # ── Signal lights ─────────────────────────────────────────────────
-        self._draw_signal_lights(surf, signals)
-
-        # ── Vehicle count badges ──────────────────────────────────────────
-        self._draw_arm_badges(surf)
-
-        # ── HUD ───────────────────────────────────────────────────────────
-        self._draw_sim_hud(surf)
-
-        # ── Alert banner (top strip of sim panel) ─────────────────────────
-        self._draw_alert_banner(surf)
-
-        if self._debug_overlay:
-            self._draw_debug_info(surf)
-
-    def _draw_zebra_crossings(self, surf: pygame.Surface) -> None:
-        """Striped pedestrian crossings at each arm entrance."""
-        road_l = SIM_CX - ROAD_WIDTH // 2
-        road_r = SIM_CX + ROAD_WIDTH // 2
-        road_t = SIM_CY - ROAD_WIDTH // 2
-        road_b = SIM_CY + ROAD_WIDTH // 2
-        isect_y_top = _sy(ISECT_TOP)
-        isect_y_bot = _sy(ISECT_BOTTOM)
-        isect_x_l   = _sx(ISECT_LEFT)
-        isect_x_r   = _sx(ISECT_RIGHT)
-
-        STRIPE = 5
-        GAP    = 5
-        DEPTH  = 18   # crossing depth perpendicular to road
-
-        # North crossing (horizontal stripes just above intersection)
-        y0 = isect_y_top - DEPTH
-        x  = road_l
-        while x < road_r:
-            pygame.draw.rect(surf, C_ZEBRA_W, (x, y0, STRIPE, DEPTH))
-            x += STRIPE + GAP
-
-        # South crossing
-        y0 = isect_y_bot
-        x  = road_l
-        while x < road_r:
-            pygame.draw.rect(surf, C_ZEBRA_W, (x, y0, STRIPE, DEPTH))
-            x += STRIPE + GAP
-
-        # East crossing (vertical stripes just right of intersection)
-        x0 = isect_x_r
-        y  = road_t
-        while y < road_b:
-            pygame.draw.rect(surf, C_ZEBRA_W, (x0, y, DEPTH, STRIPE))
-            y += STRIPE + GAP
-
-        # West crossing
-        x0 = isect_x_l - DEPTH
-        y  = road_t
-        while y < road_b:
-            pygame.draw.rect(surf, C_ZEBRA_W, (x0, y, DEPTH, STRIPE))
-            y += STRIPE + GAP
-
-    def _draw_direction_arrows(self, surf: pygame.Surface) -> None:
-        """Small direction arrows on each arm approach road."""
-        road_l = SIM_CX - ROAD_WIDTH // 2
-        road_r = SIM_CX + ROAD_WIDTH // 2
-        road_t = SIM_CY - ROAD_WIDTH // 2
-        road_b = SIM_CY + ROAD_WIDTH // 2
-        isect_y_top = _sy(ISECT_TOP)
-        isect_y_bot = _sy(ISECT_BOTTOM)
-        isect_x_l   = _sx(ISECT_LEFT)
-        isect_x_r   = _sx(ISECT_RIGHT)
-
-        C_ARROW = (100, 105, 120)
-
-        # North arm — arrow pointing down ↓
-        ax, ay = SIM_CX, isect_y_top - 50
-        _draw_arrow(surf, C_ARROW, (ax, ay - 12), (ax, ay + 12), 8)
-
-        # South arm — arrow pointing up ↑
-        ax, ay = SIM_CX, isect_y_bot + 50
-        _draw_arrow(surf, C_ARROW, (ax, ay + 12), (ax, ay - 12), 8)
-
-        # East arm — arrow pointing left ←
-        ax, ay = isect_x_r + 50, SIM_CY
-        _draw_arrow(surf, C_ARROW, (ax + 12, ay), (ax - 12, ay), 8)
-
-        # West arm — arrow pointing right →
-        ax, ay = isect_x_l - 50, SIM_CY
-        _draw_arrow(surf, C_ARROW, (ax - 12, ay), (ax + 12, ay), 8)
-
-    def _draw_signal_lights(
-        self, surf: pygame.Surface, signals: dict[str, str]
-    ) -> None:
+        # Signal lights
         for arm in ARM_NAMES:
-            sig     = signals.get(arm, 'RED')
-            cx, cy  = _SIG_POS[arm]
-            is_ns   = arm in ('North', 'South')
-
-            hw = _SIG_R * 2 + 8
-            hh = _SIG_R * 6 + 12
-            if not is_ns:
-                hw, hh = hh, hw
-
-            pygame.draw.rect(surf, (18, 20, 25),
-                             (cx - hw // 2, cy - hh // 2, hw, hh), border_radius=4)
-            pygame.draw.rect(surf, (40, 44, 52),
-                             (cx - hw // 2, cy - hh // 2, hw, hh), 1, border_radius=4)
-
-            if is_ns:
-                lamp_pos = [
-                    (cx, cy - _SIG_R * 2),
-                    (cx, cy),
-                    (cx, cy + _SIG_R * 2),
-                ]
+            sig = sigs.get(arm, 'RED')
+            cx, cy = _SIG_POS[arm]
+            ns = arm in ('North', 'South')
+            hw = _SIG_R * 2 + 10;  hh = _SIG_R * 6 + 16
+            if not ns: hw, hh = hh, hw
+            pygame.draw.rect(surf, (48, 54, 65), (cx - hw // 2, cy - hh // 2, hw, hh), border_radius=5)
+            pygame.draw.rect(surf, (28, 32, 40), (cx - hw // 2, cy - hh // 2, hw, hh), 1, border_radius=5)
+            lamps = [(cx, cy - _SIG_R * 2), (cx, cy), (cx + _SIG_R * 2 if not ns else 0,
+                      cy + _SIG_R * 2 if ns else cy)] if ns else \
+                    [(cx - _SIG_R * 2, cy), (cx, cy), (cx + _SIG_R * 2, cy)]
+            # Re-derive cleanly
+            if ns:
+                lamps = [(cx, cy - _SIG_R * 2), (cx, cy), (cx, cy + _SIG_R * 2)]
             else:
-                lamp_pos = [
-                    (cx - _SIG_R * 2, cy),
-                    (cx, cy),
-                    (cx + _SIG_R * 2, cy),
-                ]
-
-            lamp_defs = [('RED', SIM_COLOR_RED), ('YELLOW', SIM_COLOR_YELLOW), ('GREEN', SIM_COLOR_GREEN)]
-            for (lx, ly), (phase, on_color) in zip(lamp_pos, lamp_defs):
+                lamps = [(cx - _SIG_R * 2, cy), (cx, cy), (cx + _SIG_R * 2, cy)]
+            defs = [('RED', _SIG_RED), ('YELLOW', _SIG_YELLOW), ('GREEN', _SIG_GREEN)]
+            for (lx, ly), (phase, on) in zip(lamps, defs):
                 active = (sig == phase) or (sig == 'WALK' and phase == 'RED')
-                color  = on_color if active else (30, 30, 30)
-                pygame.draw.circle(surf, color, (lx, ly), _SIG_R)
-                pygame.draw.circle(surf, (0, 0, 0), (lx, ly), _SIG_R, 1)
+                col    = on if active else (42, 44, 52)
+                pygame.draw.circle(surf, col, (lx, ly), _SIG_R)
+                pygame.draw.circle(surf, (20, 22, 28), (lx, ly), _SIG_R, 1)
+                if active:
+                    gsurf = pygame.Surface((_SIG_R * 4, _SIG_R * 4), pygame.SRCALPHA)
+                    pygame.draw.circle(gsurf, (*on, 55), (_SIG_R * 2, _SIG_R * 2), _SIG_R * 2)
+                    surf.blit(gsurf, (lx - _SIG_R * 2, ly - _SIG_R * 2))
 
-    def _draw_arm_badges(self, surf: pygame.Surface) -> None:
-        """Vehicle count badge at each arm entrance."""
+        # Arm badges
         counts = self._vehicles.vehicle_count_by_arm()
         for arm in ARM_NAMES:
-            n   = counts.get(arm, 0)
-            sel = (arm == self._selected_arm)
-            lx, ly = _ARM_LABEL_POS[arm]
+            n = counts.get(arm, 0); sel = (arm == self._selected_arm)
+            bx, by = _BADGE_POS[arm]
+            bg = C_BTN_SEL if sel else C_PANEL_WHITE
+            tc = C_TEXT_WHITE if sel else C_TEXT_DARK
+            lbl = self._fonts['sm'].render(f"{arm[0]}  {n:2d}", True, tc)
+            pad = 6; r = pygame.Rect(bx - pad, by - 3, lbl.get_width() + pad * 2, 20)
+            pygame.draw.rect(surf, bg, r, border_radius=4)
+            pygame.draw.rect(surf, C_DIVIDER, r, 1, border_radius=4)
+            surf.blit(lbl, (bx, by))
 
-            bg = C_BTN_SEL if sel else (30, 35, 45)
-            text = f"{arm[0]}:{n:2d}"
-            lbl  = self._fonts['sm'].render(text, True, C_TEXT_MAIN if sel else C_TEXT_DIM)
-            pad  = 4
-            r    = pygame.Rect(lx - pad, ly - 2, lbl.get_width() + pad * 2, 16)
-            pygame.draw.rect(surf, bg, r, border_radius=3)
-            surf.blit(lbl, (lx, ly))
+        # HUD card
+        self._draw_hud(surf)
 
-    def _draw_sim_hud(self, surf: pygame.Surface) -> None:
-        """Bottom-left HUD: phase + per-arm data table."""
-        phase_snap   = self._state.snapshot_phase()
-        arm_snap     = self._state.snapshot_arms()
-        phase        = phase_snap.get('phase', 'normal')
-        current_green= phase_snap.get('current_green')
-        phase_color  = _PHASE_COLORS.get(phase, C_TEXT_DIM)
+        # Alert banner
+        self._draw_banner(surf)
 
-        hud_x  = 6
-        hud_y  = SIM_DRAW_H - 120
-        hud_w  = 400
-        hud_h  = 114
+        if self._debug:
+            q = self._vehicles.vehicle_count_by_arm()
+            qq = self._vehicles.queued_count_by_arm()
+            yy = 46
+            for arm in ARM_NAMES:
+                t = self._fonts['mono_sm'].render(
+                    f"[D] {arm:<6} total={q[arm]:2d} queued={qq[arm]:2d}", True, C_BTN_PED)
+                surf.blit(t, (SIM_PANEL_W - 220, yy)); yy += 15
 
-        hud_surf = pygame.Surface((hud_w, hud_h), pygame.SRCALPHA)
-        hud_surf.fill((12, 15, 20, 190))
-        surf.blit(hud_surf, (hud_x, hud_y))
-        pygame.draw.rect(surf, C_PANEL_DIV, (hud_x, hud_y, hud_w, hud_h), 1)
+    def _draw_hud(self, surf: pygame.Surface) -> None:
+        ph   = self._state.snapshot_phase()
+        armp = self._state.snapshot_arms()
+        phase   = ph.get('phase', 'normal')
+        cur_grn = ph.get('current_green')
+        p_col   = _PHASE_COL.get(phase, C_TEXT_DIM)
+        hx, hy, hw, hh = 10, SIM_DRAW_H - 142, 490, 136
 
-        phase_lbl = self._fonts['md'].render(
-            f"PHASE: {phase.upper():<12}  cycles={phase_snap.get('total_cycles', 0)}",
-            True, phase_color,
-        )
-        surf.blit(phase_lbl, (hud_x + 5, hud_y + 4))
+        # Shadow
+        sh = pygame.Surface((hw + 4, hh + 4), pygame.SRCALPHA)
+        sh.fill((0, 0, 0, 28)); surf.blit(sh, (hx + 2, hy + 2))
+        pygame.draw.rect(surf, C_HUD_BG,     (hx, hy, hw, hh), border_radius=10)
+        pygame.draw.rect(surf, C_HUD_BORDER, (hx, hy, hw, hh), 1, border_radius=10)
+
+        # Phase header
+        ph_lbl = self._fonts['lg'].render(
+            f"PHASE: {phase.upper()}    cycles = {ph.get('total_cycles', 0)}", True, p_col)
+        surf.blit(ph_lbl, (hx + 12, hy + 10))
+        pygame.draw.line(surf, C_HUD_BORDER, (hx + 12, hy + 34), (hx + hw - 12, hy + 34), 1)
 
         for i, arm in enumerate(ARM_NAMES):
-            s      = arm_snap.get(arm, {})
-            sig  = getattr(s, "signal", "RED")
-            dens = getattr(s, "density", 0.0)
-            wait = getattr(s, "wait_time", 0.0)
-            emrg = getattr(s, "emergency", False)
-            hzrd = getattr(s, "hazard", False)
-            is_grn = (arm == current_green)
+            s    = armp.get(arm, {})
+            sig  = s.get('signal_state', 'RED')
+            dens = s.get('density',   0.0)
+            wait = s.get('wait_time', 0.0)
+            emrg = s.get('emergency', False)
+            hzrd = s.get('hazard',    False)
+            grn  = (arm == cur_grn)
 
-            sig_color = (C_TEXT_GREEN if sig == 'GREEN' else
-                         C_TEXT_YEL   if sig == 'YELLOW' else C_TEXT_RED)
-            row_color  = C_TEXT_GREEN if is_grn else C_TEXT_MAIN
-            row_y      = hud_y + 22 + i * 20
+            sc = C_GREEN_TEXT if sig == 'GREEN' else (C_YELLOW_TEXT if sig == 'YELLOW' else C_RED_TEXT)
+            rc = C_GREEN_TEXT if grn else C_TEXT_DARK
+            ry = hy + 40 + i * 22
 
-            dot_col = SIM_COLOR_GREEN if is_grn else SIM_COLOR_RED
-            pygame.draw.circle(surf, dot_col, (hud_x + 12, row_y + 6), 4)
+            dot = _SIG_GREEN if grn else _SIG_RED
+            pygame.draw.circle(surf, dot, (hx + 16, ry + 8), 6)
 
-            badge = self._fonts['sm'].render(f"{sig[0]}", True, sig_color)
-            surf.blit(badge, (hud_x + 22, row_y))
+            surf.blit(self._fonts['mono_sm'].render(sig[0], True, sc), (hx + 30, ry + 2))
+            flags   = (" ⚠EMRG" if emrg else "") + (" ⚠HZRD" if hzrd else "")
+            row_txt = f"{arm:<6}  dens={dens:5.1f}  wait={int(wait):3d}s{flags}"
+            surf.blit(self._fonts['mono_sm'].render(row_txt, True, rc), (hx + 44, ry + 2))
 
-            flags    = (" EMRG" if emrg else "") + (" HZRD" if hzrd else "")
-            row_text = f"{arm:<6} d={dens:5.1f} w={int(wait):3d}s{flags}"
-            row_lbl  = self._fonts['sm'].render(row_text, True, row_color)
-            surf.blit(row_lbl, (hud_x + 34, row_y))
-
-            bar_x  = hud_x + 290
-            bar_w  = 35
-            bar_h  = 9
-            fill   = int(min(1.0, dens / 50.0) * bar_w)
-            bar_c  = _density_color(dens / 50.0)
-            pygame.draw.rect(surf, C_HBAR_BG, (bar_x, row_y + 1, bar_w, bar_h))
+            # Density bar
+            bx  = hx + 365; bw = 110; bht = 12
+            fill = int(min(1.0, dens / 50.0) * bw)
+            pygame.draw.rect(surf, C_BG,       (bx, ry + 3, bw, bht), border_radius=4)
             if fill > 0:
-                pygame.draw.rect(surf, bar_c, (bar_x, row_y + 1, fill, bar_h))
-            pygame.draw.rect(surf, C_TEXT_DIM, (bar_x, row_y + 1, bar_w, bar_h), 1)
+                pygame.draw.rect(surf, _density_col(dens / 50.0), (bx, ry + 3, fill, bht), border_radius=4)
+            pygame.draw.rect(surf, C_DIVIDER,  (bx, ry + 3, bw, bht), 1, border_radius=4)
 
-        fps_lbl = self._fonts['title'].render(
-            f"SIM {self._display_fps:.0f}fps  zoom={self._zoom:.1f}x  "
-            f"vehicles={len(self._vehicles.all_vehicles())}",
-            True, C_TEXT_DIM,
-        )
-        surf.blit(fps_lbl, (hud_x + 5, hud_y + hud_h - 12))
+        fps_txt = self._fonts['xs'].render(
+            f"zoom={self._zoom:.1f}×   vehicles={len(self._vehicles.all_vehicles())}   {self._fps_disp:.0f} fps",
+            True, C_TEXT_DIM)
+        surf.blit(fps_txt, (hx + 12, hy + hh - 14))
 
-    def _draw_alert_banner(self, surf: pygame.Surface) -> None:
-        phase_snap   = self._state.snapshot_phase()
-        arm_snap     = self._state.snapshot_arms()
-        phase        = phase_snap.get('phase', 'normal')
-        emrg_arm = next((a for a, s in arm_snap.items() if getattr(s, "emergency", False)), None)
-        hzrd_info = next(((a, getattr(s, "hazard", False)) for a, s in arm_snap.items() 
-                        if getattr(s, "hazard", False)), None)
-
-        banner_h = 30
-        banner   = pygame.Surface((SIM_PANEL_W, banner_h), pygame.SRCALPHA)
-
-        if phase == 'emergency' and emrg_arm:
-            banner.fill((*C_EMRG_BG, 225))
-            surf.blit(banner, (0, 0))
-            txt = self._fonts['lg'].render(
-                f"  🚨  EMERGENCY — {emrg_arm.upper()} ARM PRIORITY",
-                True, (255, 255, 255),
-            )
-            surf.blit(txt, (8, 6))
-
+    def _draw_banner(self, surf: pygame.Surface) -> None:
+        ph   = self._state.snapshot_phase()
+        armp = self._state.snapshot_arms()
+        phase = ph.get('phase', 'normal')
+        emrg  = next((a for a, s in armp.items() if s.get('emergency', False)), None)
+        hzrd  = next(((a, True) for a, s in armp.items() if s.get('hazard', False)), None)
+        bh = 40; bs = pygame.Surface((SIM_PANEL_W, bh), pygame.SRCALPHA)
+        if phase == 'emergency' and emrg:
+            bs.fill((*C_BANNER_EMRG, 238)); surf.blit(bs, (0, 0))
+            surf.blit(self._fonts['lg'].render(
+                f"  🚨  EMERGENCY OVERRIDE — {emrg.upper()} ARM PRIORITY", True, C_TEXT_WHITE), (12, 10))
         elif phase == 'pedestrian':
-            banner.fill((*C_PED_BG, 215))
-            surf.blit(banner, (0, 0))
-            avg = phase_snap.get('ped_rolling_avg', 0.0)
-            txt = self._fonts['lg'].render(
-                f"  🚶  PEDESTRIAN PHASE  ({avg:.0f} persons)",
-                True, (255, 255, 255),
-            )
-            surf.blit(txt, (8, 6))
+            bs.fill((*C_BANNER_PED, 228)); surf.blit(bs, (0, 0))
+            avg = ph.get('ped_rolling_avg', 0.0)
+            surf.blit(self._fonts['lg'].render(
+                f"  🚶  PEDESTRIAN PHASE ACTIVE — {avg:.0f} persons detected", True, C_TEXT_WHITE), (12, 10))
+        elif hzrd:
+            a, _ = hzrd; bs.fill((*C_BANNER_HZRD, 228)); surf.blit(bs, (0, 0))
+            surf.blit(self._fonts['lg'].render(
+                f"  ⚠  ANIMAL ON ROAD — {a.upper()} ARM  (+5s extension)", True, C_TEXT_WHITE), (12, 10))
 
-        elif hzrd_info:
-            a, _ = hzrd_info
-            banner.fill((*C_HZRD_BG, 215))
-            surf.blit(banner, (0, 0))
-            txt = self._fonts['lg'].render(
-                f"  ⚠  ANIMAL ON ROAD — {a.upper()} ARM  (+5s extension)",
-                True, (255, 255, 255),
-            )
-            surf.blit(txt, (8, 6))
+    # ── Control strip ─────────────────────────────────────────────────────────
 
-    def _draw_debug_info(self, surf: pygame.Surface) -> None:
-        counts = self._vehicles.vehicle_count_by_arm()
-        queued = self._vehicles.queued_count_by_arm()
-        y = 36
-        for arm in ARM_NAMES:
-            txt = self._fonts['sm'].render(
-                f"[D] {arm:<6} total={counts[arm]:2d} queued={queued[arm]:2d}",
-                True, (100, 200, 255),
-            )
-            surf.blit(txt, (SIM_PANEL_W - 200, y))
-            y += 14
+    def _draw_control_strip(self) -> None:
+        surf = self._screen
+        py   = SIM_DRAW_H
+        pygame.draw.rect(surf, C_CTRL_BG, (0, py, SIM_PANEL_W, CTRL_H))
+        pygame.draw.line(surf, C_CTRL_BORDER, (0, py), (SIM_PANEL_W, py), 2)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Control panel (never zoomed)
-    # ─────────────────────────────────────────────────────────────────────────
+        # Arm selector
+        for i, (arm, r) in enumerate(zip(_ARM_BTNS, self._arm_rects)):
+            sel = (arm == self._selected_arm); hov = (self._hover_arm == i)
+            bg  = C_BTN_SEL if sel else (C_BTN_HOVER if hov else C_BTN_DEFAULT)
+            tc  = C_TEXT_WHITE if sel else C_TEXT_DARK
+            pygame.draw.rect(surf, bg, r, border_radius=6)
+            lbl = self._fonts['btn'].render(arm[0], True, tc)
+            surf.blit(lbl, _ctr(lbl, r))
 
-    def _draw_control_panel(self) -> None:
-        surf  = self._screen
-        py    = SIM_DRAW_H    # panel top y in window
+        # Arm name label
+        ai = self._fonts['sm'].render(f"Target arm: {self._selected_arm}  [TAB]", True, C_TEXT_MID)
+        surf.blit(ai, (self._arm_rects[-1].right + 10, self._arm_rects[0].centery - ai.get_height() // 2))
 
-        # Background
-        pygame.draw.rect(surf, C_CTRL_BG, (0, py, SIM_PANEL_W, CTRL_PANEL_H))
-        pygame.draw.line(surf, C_PANEL_DIV, (0, py), (SIM_PANEL_W, py), 1)
+        # Auto-spawn
+        r  = self._auto_rect
+        bg = C_BTN_AUTO_ON if self._auto_spawn else C_BTN_DEFAULT
+        tc = C_TEXT_WHITE  if self._auto_spawn else C_TEXT_DARK
+        pygame.draw.rect(surf, bg, r, border_radius=6)
+        surf.blit(self._fonts['btn'].render("▶ AUTO" if self._auto_spawn else "■ AUTO", True, tc), _ctr(self._fonts['btn'].render("▶ AUTO" if self._auto_spawn else "■ AUTO", True, tc), r))
 
-        # ── Row 1: Arm selector ───────────────────────────────────────────
-        for i, (arm, rect) in enumerate(zip(_ARM_BTNS, self._arm_btn_rects)):
-            selected = (arm == self._selected_arm)
-            hovered  = (self._hover_arm == i)
-            bg = C_BTN_SEL if selected else (C_BTN_HOVER if hovered else C_BTN_IDLE)
-            pygame.draw.rect(surf, bg, rect, border_radius=4)
-            lbl = self._fonts['btn'].render(arm[0], True,
-                                            C_TEXT_MAIN if selected else C_TEXT_DIM)
-            surf.blit(lbl, (rect.x + rect.w // 2 - lbl.get_width() // 2,
-                            rect.y + rect.h // 2 - lbl.get_height() // 2))
-
-        # Arm label
-        lbl = self._fonts['title'].render(
-            f"TARGET ARM: {self._selected_arm}  (TAB to cycle)",
-            True, C_TEXT_DIM,
-        )
-        ax   = self._arm_btn_rects[-1].right + 8
-        surf.blit(lbl, (ax, self._arm_btn_rects[0].y + 6))
-
-        # ── Auto-spawn button ─────────────────────────────────────────────
-        r  = self._auto_btn_rect
-        bg = C_BTN_ACTIVE if self._auto_spawn else C_BTN_IDLE
-        pygame.draw.rect(surf, bg, r, border_radius=4)
-        auto_lbl = self._fonts['btn'].render(
-            "AUTO ▶" if self._auto_spawn else "AUTO ■", True,
-            C_TEXT_GREEN if self._auto_spawn else C_TEXT_DIM,
-        )
-        surf.blit(auto_lbl, (r.x + r.w // 2 - auto_lbl.get_width() // 2,
-                              r.y + r.h // 2 - auto_lbl.get_height() // 2))
-
-        # ── Zoom buttons ──────────────────────────────────────────────────
-        for rect, label in (
-            (self._zoom_in_rect,    "Z+"),
-            (self._zoom_out_rect,   "Z-"),
-            (self._reset_zoom_rect, " 1:1"),
-        ):
+        # Zoom buttons
+        for rect, label in [(self._zoom_in_rect, "Z+"), (self._zoom_out_rect, "Z−"), (self._zoom_rst_rect, "1:1")]:
             if rect:
-                pygame.draw.rect(surf, C_BTN_IDLE, rect, border_radius=4)
-                zl = self._fonts['btn'].render(label, True, C_TEXT_DIM)
-                surf.blit(zl, (rect.x + rect.w // 2 - zl.get_width() // 2,
-                               rect.y + rect.h // 2 - zl.get_height() // 2))
+                pygame.draw.rect(surf, C_BTN_ZOOM, rect, border_radius=6)
+                lbl = self._fonts['btn'].render(label, True, C_TEXT_DARK)
+                surf.blit(lbl, _ctr(lbl, rect))
 
-        # ── Row 2: Spawn buttons ──────────────────────────────────────────
-        _BTN_COLORS = {
-            'car':        C_BTN_IDLE,
-            'bus':        C_BTN_IDLE,
-            'auto':       C_BTN_IDLE,
-            'motorcycle': C_BTN_IDLE,
-            'ped':        C_BTN_PED,
-            'animal':     C_BTN_ANIMAL,
-            'ambulance':  C_BTN_EMRG,
-        }
+        # Spawn buttons
+        _BG = {'ped': C_BTN_PED, 'animal': C_BTN_ANIMAL, 'ambulance': C_BTN_EMRG}
+        _TC = {'ped': C_TEXT_WHITE, 'animal': C_TEXT_WHITE, 'ambulance': C_TEXT_WHITE}
+        for i, (btn, r) in enumerate(zip(_SPAWN_BTNS, self._spawn_rects)):
+            hov  = (self._hover_spawn == i)
+            base = _BG.get(btn['cls'], C_BTN_DEFAULT)
+            bg   = tuple(min(255, c + 22) for c in base) if hov else base
+            tc   = _TC.get(btn['cls'], C_TEXT_DARK)
+            pygame.draw.rect(surf, bg, r, border_radius=7)
+            pygame.draw.rect(surf, C_CTRL_BORDER, r, 1, border_radius=7)
+            lbl = self._fonts['btn'].render(btn['label'], True, tc)
+            surf.blit(lbl, _ctr(lbl, r))
+            kl = self._fonts['xs'].render(f"[{btn['key']}]", True, C_TEXT_DIM)
+            surf.blit(kl, (r.centerx - kl.get_width() // 2, r.bottom + 2))
 
-        for i, (btn, rect) in enumerate(zip(_SPAWN_BTNS, self._spawn_btn_rects)):
-            hovered = (self._hover_btn == i)
-            base    = _BTN_COLORS.get(btn['cls'], C_BTN_IDLE)
-            bg      = tuple(min(255, c + 30) for c in base) if hovered else base
-            pygame.draw.rect(surf, bg, rect, border_radius=5)
-            pygame.draw.rect(surf, C_PANEL_DIV, rect, 1, border_radius=5)
+        st = self._fonts['xs'].render(
+            f"rate={self._spawn_rate:.1f}/s   speed={self._sim_speed:.1f}×   "
+            f"scroll=zoom   mid-drag=pan   [0]=reset view   [S]=screenshot",
+            True, C_TEXT_DIM)
+        surf.blit(st, (10, SIM_DRAW_H + CTRL_H - 14))
 
-            lbl = self._fonts['btn'].render(btn['label'], True, C_TEXT_MAIN)
-            surf.blit(lbl, (rect.x + rect.w // 2 - lbl.get_width() // 2,
-                            rect.y + rect.h // 2 - lbl.get_height() // 2))
-
-            # Key hint below
-            key_lbl = self._fonts['title'].render(
-                f"[{btn['key']}]", True, C_TEXT_DIM
-            )
-            surf.blit(key_lbl, (rect.x + rect.w // 2 - key_lbl.get_width() // 2,
-                                 rect.bottom + 1))
-
-        # Spawn rate display
-        rate_lbl = self._fonts['title'].render(
-            f"spawn_rate={self._spawn_rate:.1f}/s  sim_speed={self._sim_speed:.1f}x  "
-            f"[scroll=zoom  mid-drag=pan  0=reset]",
-            True, C_TEXT_DIM,
-        )
-        surf.blit(rate_lbl, (8, py + CTRL_PANEL_H - 12))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Camera panel (right side)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Camera panel ──────────────────────────────────────────────────────────
 
     def _draw_camera_panel(self) -> None:
-        surf  = self._screen
-        frame = self._state.get_annotated_frame()
+        surf = self._screen; px = CAM_PANEL_X
+        pygame.draw.rect(surf, C_PANEL_WHITE, (px, 0, CAM_PANEL_W, WIN_H))
 
-        # Title bar
-        title_surf = pygame.Surface((CAM_PANEL_W, 26), pygame.SRCALPHA)
-        title_surf.fill((16, 18, 24, 240))
-        surf.blit(title_surf, (CAM_PANEL_X, 0))
-        title_lbl = self._fonts['md'].render(
-            "Live YOLO Detection Feed", True, C_TEXT_MAIN
-        )
-        surf.blit(title_lbl, (CAM_PANEL_X + 8, 5))
-        fps_lbl = self._fonts['sm'].render(f"{self._display_fps:.0f}fps", True, C_TEXT_DIM)
-        surf.blit(fps_lbl, (CAM_PANEL_X + CAM_PANEL_W - fps_lbl.get_width() - 6, 7))
+        # Header bar
+        pygame.draw.rect(surf, C_BTN_SEL, (px, 0, CAM_PANEL_W, 44))
+        surf.blit(self._fonts['lg'].render("Live YOLO Detection Feed", True, C_TEXT_WHITE),
+                  (px + 14, 11))
+        fps_l = self._fonts['sm'].render(f"{self._fps_disp:.0f} fps", True, C_TEXT_WHITE)
+        surf.blit(fps_l, (px + CAM_PANEL_W - fps_l.get_width() - 14, 13))
 
         # Camera feed
-        cam_h    = 400
-        cam_rect = pygame.Rect(CAM_PANEL_X, 28, CAM_PANEL_W, cam_h)
-
+        cam_h    = 385
+        cam_rect = pygame.Rect(px + 8, 52, CAM_PANEL_W - 16, cam_h)
+        frame    = self._state.get_annotated_frame()
         if frame is not None:
             try:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_rgb = cv2.resize(frame_rgb, (CAM_PANEL_W, cam_h))
-                cam_surf  = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
-                surf.blit(cam_surf, cam_rect.topleft)
+                rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb  = cv2.resize(rgb, (cam_rect.w, cam_rect.h))
+                csf  = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+                surf.blit(csf, cam_rect.topleft)
             except Exception:
-                self._draw_no_camera(surf, cam_rect)
+                self._no_camera(surf, cam_rect)
         else:
-            self._draw_no_camera(surf, cam_rect)
+            self._no_camera(surf, cam_rect)
+        pygame.draw.rect(surf, C_DIVIDER, cam_rect, 1)
+        self._draw_cam_banner(surf, cam_rect)
 
-        pygame.draw.rect(surf, C_PANEL_DIV, cam_rect, 1)
-        self._draw_alert_banner_cam(surf, cam_rect)
-        self._draw_metrics_sidebar(surf, cam_rect.bottom + 6)
+        # Metrics below camera
+        self._draw_metrics(surf, cam_rect.bottom + 14)
 
-    def _draw_no_camera(self, surf: pygame.Surface, rect: pygame.Rect) -> None:
-        pygame.draw.rect(surf, (18, 20, 26), rect)
+    def _no_camera(self, surf, rect) -> None:
+        pygame.draw.rect(surf, (226, 230, 240), rect)
         msg = self._fonts['md'].render("Waiting for detection feed...", True, C_TEXT_DIM)
-        surf.blit(msg, (
-            rect.x + rect.w // 2 - msg.get_width() // 2,
-            rect.y + rect.h // 2,
-        ))
+        surf.blit(msg, (rect.centerx - msg.get_width() // 2, rect.centery - 10))
 
-    def _draw_alert_banner_cam(self, surf: pygame.Surface, cam_rect: pygame.Rect) -> None:
-        phase_snap = self._state.snapshot_phase()
-        arm_snap   = self._state.snapshot_arms()
-        phase      = phase_snap.get('phase', 'normal')
-        emrg_arm = next((a for a, s in arm_snap.items() if getattr(s, "emergency", False)), None)
-        hzrd_info = next(((a, getattr(s, "hazard", False)) for a, s in arm_snap.items() if getattr(s, "hazard", False)), None)
-
-        bh      = 32
-        b_rect  = pygame.Rect(cam_rect.x, cam_rect.y, cam_rect.w, bh)
-        b_surf  = pygame.Surface((cam_rect.w, bh), pygame.SRCALPHA)
-
-        if phase == 'emergency' and emrg_arm:
-            b_surf.fill((*C_EMRG_BG, 228))
-            surf.blit(b_surf, b_rect.topleft)
-            txt = self._fonts['lg'].render(
-                f"  🚨  EMERGENCY — {emrg_arm.upper()} ARM", True, (255, 255, 255)
-            )
-            surf.blit(txt, (cam_rect.x + 6, cam_rect.y + 7))
+    def _draw_cam_banner(self, surf, cam_rect) -> None:
+        ph   = self._state.snapshot_phase()
+        armp = self._state.snapshot_arms()
+        phase = ph.get('phase', 'normal')
+        emrg  = next((a for a, s in armp.items() if s.get('emergency', False)), None)
+        hzrd  = next(((a, True) for a, s in armp.items() if s.get('hazard', False)), None)
+        bh = 36; bs = pygame.Surface((cam_rect.w, bh), pygame.SRCALPHA)
+        if phase == 'emergency' and emrg:
+            bs.fill((*C_BANNER_EMRG, 235)); surf.blit(bs, cam_rect.topleft)
+            surf.blit(self._fonts['md'].render(f"  🚨  EMERGENCY — {emrg.upper()} ARM", True, C_TEXT_WHITE),
+                      (cam_rect.x + 8, cam_rect.y + 9))
         elif phase == 'pedestrian':
-            b_surf.fill((*C_PED_BG, 215))
-            surf.blit(b_surf, b_rect.topleft)
-            avg = phase_snap.get('ped_rolling_avg', 0.0)
-            txt = self._fonts['lg'].render(
-                f"  🚶  PEDESTRIAN PHASE  ({avg:.0f} persons)", True, (255, 255, 255)
-            )
-            surf.blit(txt, (cam_rect.x + 6, cam_rect.y + 7))
-        elif hzrd_info:
-            a, _ = hzrd_info
-            b_surf.fill((*C_HZRD_BG, 215))
-            surf.blit(b_surf, b_rect.topleft)
-            txt = self._fonts['lg'].render(
-                f"  ⚠  ANIMAL — {a.upper()} ARM", True, (255, 255, 255)
-            )
-            surf.blit(txt, (cam_rect.x + 6, cam_rect.y + 7))
+            bs.fill((*C_BANNER_PED, 225)); surf.blit(bs, cam_rect.topleft)
+            avg = ph.get('ped_rolling_avg', 0.0)
+            surf.blit(self._fonts['md'].render(f"  🚶  PEDESTRIAN PHASE  ({avg:.0f} persons)", True, C_TEXT_WHITE),
+                      (cam_rect.x + 8, cam_rect.y + 9))
+        elif hzrd:
+            a, _ = hzrd; bs.fill((*C_BANNER_HZRD, 225)); surf.blit(bs, cam_rect.topleft)
+            surf.blit(self._fonts['md'].render(f"  ⚠  ANIMAL — {a.upper()} ARM", True, C_TEXT_WHITE),
+                      (cam_rect.x + 8, cam_rect.y + 9))
 
-    def _draw_metrics_sidebar(self, surf: pygame.Surface, y_start: int) -> None:
-        arm_snap   = self._state.snapshot_arms()
-        phase_snap = self._state.snapshot_phase()
+    def _draw_metrics(self, surf, y0: int) -> None:
+        ph   = self._state.snapshot_phase()
+        armp = self._state.snapshot_arms()
+        cur  = ph.get('current_green')
+        px   = CAM_PANEL_X + 14
 
-        x0    = CAM_PANEL_X + 6
-        y     = y_start
-        col_w = (CAM_PANEL_W - 12) // 4
+        sec = self._fonts['lg'].render("Traffic Analytics", True, C_TEXT_DARK)
+        surf.blit(sec, (px, y0))
+        pygame.draw.line(surf, C_DIVIDER, (px, y0 + 24), (px + CAM_PANEL_W - 28, y0 + 24), 1)
+        y0 += 30
 
-        headers = ['ARM', 'DENSITY', 'WAIT', 'SIGNAL']
-        for i, h in enumerate(headers):
-            lbl = self._fonts['title'].render(h, True, C_TEXT_DIM)
-            surf.blit(lbl, (x0 + i * col_w, y))
-        y += 14
-        pygame.draw.line(surf, C_PANEL_DIV, (x0, y), (x0 + CAM_PANEL_W - 12, y), 1)
-        y += 4
+        # Column headers
+        cx_list = [px, px + 78, px + 175, px + 260, px + 340]
+        for hdr, cx in zip(['ARM', 'SIGNAL', 'DENSITY', 'WAIT', 'BAR'], cx_list):
+            surf.blit(self._fonts['xs'].render(hdr, True, C_TEXT_DIM), (cx, y0))
+        y0 += 18
 
         for arm in ARM_NAMES:
-            s = arm_snap.get(arm, {})
-            sig = getattr(s, 'signal', 'RED')
-            dens = getattr(s, 'density', 0.0)
-            wait = getattr(s, 'wait_time', 0.0)
-            is_grn = (arm == phase_snap.get('current_green'))
+            s    = armp.get(arm, {})
+            sig  = s.get('signal_state', 'RED')
+            dens = s.get('density',   0.0)
+            wait = s.get('wait_time', 0.0)
+            grn  = (arm == cur)
 
-            sig_color = (C_TEXT_GREEN if sig == 'GREEN' else
-                         C_TEXT_YEL  if sig == 'YELLOW' else C_TEXT_RED)
-            row_color = C_TEXT_GREEN if is_grn else C_TEXT_MAIN
+            if grn:
+                pygame.draw.rect(surf, (228, 248, 232),
+                                 pygame.Rect(px - 6, y0 - 2, CAM_PANEL_W - 20, 22), border_radius=4)
 
-            cols   = [arm[:5], f"{dens:5.1f}", f"{int(wait):3d}s", sig]
-            colors = [row_color, row_color, row_color, sig_color]
+            sc = C_GREEN_TEXT if sig == 'GREEN' else (C_YELLOW_TEXT if sig == 'YELLOW' else C_RED_TEXT)
+            rc = C_GREEN_TEXT if grn else C_TEXT_DARK
 
-            for i, (col_txt, col_color) in enumerate(zip(cols, colors)):
-                lbl = self._fonts['sm'].render(col_txt, True, col_color)
-                surf.blit(lbl, (x0 + i * col_w, y))
+            surf.blit(self._fonts['md'].render(arm,           True, rc), (cx_list[0], y0))
+            surf.blit(self._fonts['md'].render(sig,           True, sc), (cx_list[1], y0))
+            surf.blit(self._fonts['md'].render(f"{dens:.1f}", True, C_TEXT_MID), (cx_list[2], y0))
+            surf.blit(self._fonts['md'].render(f"{int(wait)}s", True, C_TEXT_MID), (cx_list[3], y0))
 
-            bar_x = x0 + col_w + 52
-            bar_w = 46
-            bar_h = 8
-            fill  = int(min(1.0, dens / 50.0) * bar_w)
-            pygame.draw.rect(surf, C_HBAR_BG, (bar_x, y + 2, bar_w, bar_h))
+            bx = cx_list[4]; bw = CAM_PANEL_W - bx + CAM_PANEL_X - 22; bht = 13
+            fill = int(min(1.0, dens / 50.0) * bw)
+            pygame.draw.rect(surf, C_BG,      (bx, y0 + 3, bw, bht), border_radius=4)
             if fill > 0:
-                pygame.draw.rect(surf, _density_color(dens / 50.0),
-                                 (bar_x, y + 2, fill, bar_h))
-            pygame.draw.rect(surf, C_TEXT_DIM, (bar_x, y + 2, bar_w, bar_h), 1)
-            y += 18
+                pygame.draw.rect(surf, _density_col(dens / 50.0), (bx, y0 + 3, fill, bht), border_radius=4)
+            pygame.draw.rect(surf, C_DIVIDER, (bx, y0 + 3, bw, bht), 1, border_radius=4)
+            y0 += 24
 
-        y += 4
-        pygame.draw.line(surf, C_PANEL_DIV, (x0, y), (x0 + CAM_PANEL_W - 12, y), 1)
-        y += 6
+        pygame.draw.line(surf, C_DIVIDER, (px, y0 + 4), (px + CAM_PANEL_W - 28, y0 + 4), 1)
+        y0 += 12
 
-        uptime  = phase_snap.get('uptime_s', 0.0)
+        uptime  = ph.get('uptime_s',        0.0)
         cleared = self._vehicles.total_cleared()
-        cycles  = phase_snap.get('total_cycles', 0)
+        cycles  = ph.get('total_cycles',     0)
+        ped_avg = ph.get('ped_rolling_avg',  0.0)
 
-        for stat in [
-            f"Uptime:   {int(uptime // 60):02d}:{int(uptime % 60):02d}",
-            f"Cycles:   {cycles}",
-            f"Cleared:  {cleared} vehicles",
-            f"Sim FPS:  {self._display_fps:.0f}",
-        ]:
-            lbl = self._fonts['sm'].render(stat, True, C_TEXT_DIM)
-            surf.blit(lbl, (x0, y))
-            y += 15
+        for label, val in [("Uptime",          f"{int(uptime // 60):02d}:{int(uptime % 60):02d}"),
+                           ("Signal cycles",   str(cycles)),
+                           ("Vehicles cleared",str(cleared)),
+                           ("Ped avg",         f"{ped_avg:.1f} / 8.0")]:
+            surf.blit(self._fonts['sm'].render(label, True, C_TEXT_DIM),  (px, y0))
+            surf.blit(self._fonts['md'].render(val,   True, C_TEXT_DARK), (px + 148, y0))
+            y0 += 20
 
-        # Key hints
-        hints = "E:emrg  P:ped  C/B/A/M:spawn  TAB:arm  Z/X:zoom  SPACE:pause  Q:quit"
-        surf.blit(
-            self._fonts['title'].render(hints, True, C_TEXT_DIM),
-            (x0, WIN_H - 13),
-        )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Pause / screenshot
-    # ─────────────────────────────────────────────────────────────────────────
+        hints = self._fonts['xs'].render(
+            "E:emrg  P:ped  C/B/A/M:spawn  V:animal  TAB:arm  Z/X:zoom  SPACE:pause  Q:quit",
+            True, C_TEXT_DIM)
+        surf.blit(hints, (px, WIN_H - 14))
 
     def _draw_pause_overlay(self) -> None:
-        overlay = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 100))
-        self._screen.blit(overlay, (0, 0))
-        msg = self._fonts['xl'].render("PAUSED — SPACE to resume", True, C_TEXT_YEL)
-        self._screen.blit(msg, (
-            WIN_W // 2 - msg.get_width()  // 2,
-            WIN_H // 2 - msg.get_height() // 2,
-        ))
-
-    def _save_screenshot(self) -> None:
-        self._screenshot_n += 1
-        fname = f"screenshot_{self._screenshot_n:03d}.png"
-        pygame.image.save(self._screen, fname)
-        logger.info("Screenshot saved: %s", fname)
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        ov.fill((255, 255, 255, 130))
+        self._screen.blit(ov, (0, 0))
+        msg = self._fonts['xxl'].render("PAUSED — press SPACE to resume", True, C_TEXT_DARK)
+        self._screen.blit(msg, (WIN_W // 2 - msg.get_width() // 2, WIN_H // 2 - msg.get_height() // 2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure utilities
+# Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _density_color(ratio: float) -> tuple[int, int, int]:
-    ratio = max(0.0, min(1.0, ratio))
-    if ratio < 0.5:
-        t = ratio * 2.0
-        return (int(t * 220), 220, int((1 - t) * 60))
-    else:
-        t = (ratio - 0.5) * 2.0
-        return (220, int((1 - t) * 220), 0)
+def _density_col(r: float) -> tuple[int, int, int]:
+    r = max(0.0, min(1.0, r))
+    if r < 0.5:  return (int(r * 2 * 230), 200, 40)
+    else:        return (230, int((1 - (r - 0.5) * 2) * 200), 0)
 
 
-def _draw_dashed_line(
-    surf: pygame.Surface,
-    color: tuple,
-    start: tuple[int, int],
-    end: tuple[int, int],
-    dash: int = 12,
-    gap:  int = 7,
-    width: int = 1,
-) -> None:
-    x0, y0 = start
-    x1, y1 = end
-    dx     = x1 - x0
-    dy     = y1 - y0
-    length = max(1, int(math.hypot(dx, dy)))
-    nx, ny = dx / length, dy / length
-    pos    = 0
-    while pos < length:
-        seg_end = min(pos + dash, length)
-        pygame.draw.line(
-            surf, color,
-            (int(x0 + nx * pos), int(y0 + ny * pos)),
-            (int(x0 + nx * seg_end), int(y0 + ny * seg_end)),
-            width,
-        )
-        pos += dash + gap
+def _dash(surf, color, start, end, dash=12, gap=7, width=1) -> None:
+    x0, y0 = start;  x1, y1 = end
+    dx, dy  = x1 - x0, y1 - y0
+    ln = max(1, int(math.hypot(dx, dy)));  nx, ny = dx / ln, dy / ln
+    p  = 0
+    while p < ln:
+        e = min(p + dash, ln)
+        pygame.draw.line(surf, color,
+                         (int(x0 + nx * p), int(y0 + ny * p)),
+                         (int(x0 + nx * e), int(y0 + ny * e)), width)
+        p += dash + gap
 
 
-def _draw_arrow(
-    surf: pygame.Surface,
-    color: tuple,
-    start: tuple[int, int],
-    end: tuple[int, int],
-    head_size: int = 8,
-) -> None:
-    """Draw a filled arrow from start → end."""
+def _arrow(surf, color, start, end, hs=10) -> None:
     pygame.draw.line(surf, color, start, end, 2)
-    dx  = end[0] - start[0]
-    dy  = end[1] - start[1]
-    ang = math.atan2(dy, dx)
-    for side in (+0.5, -0.5):
-        px = int(end[0] - head_size * math.cos(ang + side * math.pi * 0.6))
-        py = int(end[1] - head_size * math.sin(ang + side * math.pi * 0.6))
-        pygame.draw.line(surf, color, end, (px, py), 2)
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    a = math.atan2(dy, dx)
+    for s in (+0.5, -0.5):
+        pygame.draw.line(surf, color, end,
+                         (int(end[0] - hs * math.cos(a + s * math.pi * 0.65)),
+                          int(end[1] - hs * math.sin(a + s * math.pi * 0.65))), 2)
+
+
+def _ctr(lbl, rect: pygame.Rect) -> tuple[int, int]:
+    return (rect.centerx - lbl.get_width() // 2, rect.centery - lbl.get_height() // 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1290,12 +944,14 @@ def _draw_arrow(
 def create_simulation(
     state: IntersectionState,
     emergency_detector=None,
+    camera_manager=None,
 ) -> PygameSimulation:
-    return PygameSimulation(state=state, emergency_detector=emergency_detector)
+    return PygameSimulation(state=state, emergency_detector=emergency_detector,
+                            camera_manager=camera_manager)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Standalone test  (python -m simulation.pygame_sim)
+# Standalone test
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -1309,28 +965,26 @@ if __name__ == '__main__':
     state    = create_state()
     emrg_det = EmergencyDetector()
 
-    def mock_cycle():
-        arms = ARM_NAMES
-        idx  = 0
+    def _mock():
+        idx: int = 0
         while True:
-            arm = arms[idx % len(arms)]
+            arm = ARM_NAMES[idx % len(ARM_NAMES)]
             with state.lock:
                 state.set_signal(None, 'RED')
                 state.set_signal(arm, 'GREEN')
                 state.current_green = arm
                 state.phase         = 'normal'
-                for i, a in enumerate(arms):
-                    state.arms[a].density   = (10 + i * 7 + (idx % 5) * 3) % 40
-                    state.arms[a].flow_rate = 2.0 if a == arm else 0.4
-                    state.arms[a].wait_time = (
-                        0.0 if a == arm else state.arms[a].wait_time + 8
-                    )
-                state.total_cycles += 1
+                idx_val = int(idx)
+                for i_val, a in enumerate(ARM_NAMES):
+                    val = (int(i_val) * 6 + (idx_val % 6) * 4)
+                    state.arms[a].density = (8 + val) % 45
+                    state.arms[a].flow_rate = 2.2 if a == arm else 0.3
+                    state.arms[a].wait_time = 0.0 if a == arm else state.arms[a].wait_time + 7
+                state.session_metrics['total_cycles'] = state.session_metrics.get('total_cycles', 0) + 1
             time.sleep(8)
-            with state.lock:
-                state.set_signal(arm, 'YELLOW')
+            with state.lock: state.set_signal(arm, 'YELLOW')
             time.sleep(3)
-            idx += 1
+            idx = idx + 1  # pyre-ignore
 
-    threading.Thread(target=mock_cycle, daemon=True).start()
+    threading.Thread(target=_mock, daemon=True).start()
     create_simulation(state, emergency_detector=emrg_det).run()

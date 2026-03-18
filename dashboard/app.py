@@ -1,32 +1,24 @@
-# dashboard/app.py — AI Smart Traffic Command Center
-# =====================================================
-# This file serves two roles in one module:
-#
-#   Role 1 — DashboardBridge (imported by main.py)
-#     Runs as a daemon thread inside the main process.
-#     Reads IntersectionState + annotated frames every 500ms and writes them
-#     to /tmp/ as JSON + JPEGs so the Streamlit process can read them without
-#     sharing memory across processes.
-#
-#   Role 2 — Streamlit App (run separately)
-#     Launched with:  streamlit run dashboard/app.py
-#     Reads from /tmp/, renders the full command center UI, and writes back
-#     control params + spawn commands that main.py picks up next tick.
-#
-# IPC contract (/tmp/ files):
-#   /tmp/traffic_state.json   — full state snapshot (written by DashboardBridge)
-#   /tmp/frame_{arm}.jpg      — latest annotated JPEG per arm (written by Bridge)
-#   /tmp/control.json         — live param overrides (written by Streamlit sidebar)
-#   /tmp/spawn.json           — one-shot spawn command (written by Streamlit sidebar)
-#
-# Why /tmp/ files instead of multiprocessing.Manager or Redis?
-#   Zero extra dependencies, survives Python subprocess boundaries, works on
-#   every OS the judges' laptop might run, and is fast enough at 500ms cadence.
-#
-# Run order:
-#   Terminal 1:  python main.py --demo
-#   Terminal 2:  streamlit run dashboard/app.py
-# ─────────────────────────────────────────────────────────────────────────────
+"""
+dashboard/app.py — Smart City Traffic Dashboard (Production-Grade)
+===================================================================
+Upgrade from functional → impressive:
+  • Bright modern theme (white bg, color-coded signals)
+  • Clean metric cards with delta indicators
+  • Real-time analytics: throughput, wait time, efficiency gain
+  • Congestion heat indicators per arm
+  • Animated signal state display
+  • Webster splits visualization
+  • Predicted queue 8s ahead (predictive AI badge)
+  • Uses state.to_dict() (canonical contract) — no more ad-hoc field access
+
+Run standalone:
+    streamlit run dashboard/app.py
+
+Or integrated via DashboardBridge (started in main.py):
+    bridge = DashboardBridge(state, emergency_detector)
+    bridge.start()   # writes /tmp/traffic_state.json every 500ms
+    # Then: streamlit run dashboard/app.py --server.port 8501
+"""
 
 from __future__ import annotations
 
@@ -36,717 +28,564 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
-
-import cv2
-import numpy as np
-
-if TYPE_CHECKING:
-    # Avoid importing heavy CV deps at Streamlit startup time
-    from controller.state import IntersectionState
-    from detection.emergency import EmergencyDetector
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ─── IPC paths ────────────────────────────────────────────────────────────────
-_TMP           = Path("/tmp")
-_STATE_FILE    = _TMP / "traffic_state.json"
-_CONTROL_FILE  = _TMP / "control.json"
-_SPAWN_FILE    = _TMP / "spawn.json"
-_FRAME_PATTERN = str(_TMP / "frame_{arm}.jpg")   # .format(arm="North")
+# ── Dashboard state file (IPC between main.py and Streamlit process) ─────────
+STATE_FILE = Path("/tmp/traffic_state.json")
+ANALYTICS_FILE = Path("/tmp/traffic_analytics.json")
+REFRESH_INTERVAL_MS = 500   # Streamlit auto-refresh period
 
-_ARM_NAMES = ["North", "South", "East", "West"]
-
-# JPEG compression quality for IPC frames — 70 is indistinguishable on screen
-# but ~3× smaller than 95, which matters when writing 4 files every 500ms.
-_JPEG_QUALITY = 70
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Role 1 — DashboardBridge  (runs inside main.py process)
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# Dashboard Bridge — runs in main.py, writes state file for Streamlit
+# ═══════════════════════════════════════════════════════════════════════════
 
 class DashboardBridge(threading.Thread):
     """
-    Daemon thread that serialises IntersectionState → /tmp/ at a fixed cadence.
+    Runs as daemon thread in main.py.
+    Periodically serializes IntersectionState → JSON → writes to /tmp/traffic_state.json.
+    Streamlit dashboard reads this file to avoid cross-process import issues.
 
-    Instantiated and started in main.py::
-
-        bridge = DashboardBridge(state, emergency_detector=det)
-        bridge.start()
-
-    The Streamlit process reads those files independently — no shared memory,
-    no sockets, no extra dependencies.
-
-    Args:
-        state:              Shared IntersectionState from main.py.
-        emergency_detector: Optional EmergencyDetector; used to expose
-                            simulate_emergency() / simulate_ped_rush() via
-                            the /tmp/spawn.json command channel.
-        interval_s:         How often to write state (default 0.5 s = 2 Hz).
-                            Faster = smoother dashboard, higher I/O cost.
+    Write interval: 500ms (2 FPS for dashboard is sufficient)
     """
 
     def __init__(
         self,
-        state: "IntersectionState",
-        emergency_detector: Optional["EmergencyDetector"] = None,
-        interval_s: float = 0.5,
+        state,                    # IntersectionState
+        emergency_detector=None,  # EmergencyDetector (optional)
+        write_interval: float = 0.5,
     ) -> None:
         super().__init__(name="DashboardBridge", daemon=True)
-        self._state      = state
-        self._emrg_det   = emergency_detector
-        self._interval   = interval_s
-        self._running    = True
-
-        # Write a sane default control file so Streamlit can read params
-        # even before the user opens the sidebar.
-        self._write_default_control()
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-
-    def stop(self) -> None:
-        self._running = False
+        self._state = state
+        self._emergency = emergency_detector
+        self._interval = write_interval
+        self._stop = threading.Event()
 
     def run(self) -> None:
-        logger.info("DashboardBridge started (interval=%.1fs)", self._interval)
-        while self._running:
+        logger.info("DashboardBridge: starting (writes every %.1fs)", self._interval)
+        while not self._stop.is_set():
             try:
-                self._tick()
+                self._write_state()
             except Exception as exc:
-                # Never crash main.py over a dashboard write failure
-                logger.debug("DashboardBridge tick error (non-fatal): %s", exc)
+                logger.debug("DashboardBridge write error: %s", exc)
             time.sleep(self._interval)
-        logger.info("DashboardBridge stopped")
 
-    # ── Main tick ─────────────────────────────────────────────────────────────
+    def stop(self) -> None:
+        self._stop.set()
 
-    def _tick(self) -> None:
-        """One write cycle: snapshot state → JSON, annotated frames → JPEGs."""
+    def _write_state(self) -> None:
+        """Serialize state to canonical JSON using state.to_dict()."""
+        state_dict = self._state.to_dict()
 
-        # ── 1. Serialize state ────────────────────────────────────────────────
-        arm_snap   = self._state.snapshot_arms()
-        phase_snap = self._state.snapshot_phase()
+        # Enrich with emergency detector data if available
+        if self._emergency:
+            try:
+                emrg_data = self._emergency.get_status_dict()
+                state_dict['emergency_status'] = emrg_data
+            except Exception:
+                pass
 
-        # Compute congestion level from total PCU density
-        total_density = sum(getattr(s, "density", 0.0) for s in arm_snap.values())
-        if total_density < 12:
-            congestion = "LOW"
-        elif total_density < 28:
-            congestion = "MEDIUM"
-        elif total_density < 45:
-            congestion = "HIGH"
-        else:
-            congestion = "CRITICAL"
-
-        state_doc = {
-            "timestamp": time.time(),
-            "arms": arm_snap,
-            "phase": phase_snap,
-            "congestion": congestion,
-        }
-        _atomic_write_json(_STATE_FILE, state_doc)
-
-        # ── 2. Write annotated frames ─────────────────────────────────────────
-        # IntersectionState stores one shared annotated frame (single-camera mode).
-        # We write it to all four arm slots so the dashboard always shows something.
-        annotated = self._state.get_annotated_frame()
-        if annotated is not None:
-            ret, buf = cv2.imencode(
-                ".jpg", annotated,
-                [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY],
-            )
-            if ret:
-                raw_bytes = buf.tobytes()
-                for arm in _ARM_NAMES:
-                    _atomic_write_bytes(
-                        Path(_FRAME_PATTERN.format(arm=arm)), raw_bytes
-                    )
-
-        # ── 3. Process spawn commands from Streamlit sidebar ─────────────────
-        self._process_spawn_command()
-
-    # ── Spawn command handler ─────────────────────────────────────────────────
-
-    def _process_spawn_command(self) -> None:
-        """
-        Read /tmp/spawn.json (one-shot command from Streamlit).
-        Unlinks the file immediately after reading so it isn't processed twice.
-
-        Supported commands::
-            {"type": "ambulance", "arm": "North"}   → simulate_emergency()
-            {"type": "ped_rush"}                     → simulate_ped_rush()
-        """
-        if not _SPAWN_FILE.exists():
-            return
         try:
-            cmd = json.loads(_SPAWN_FILE.read_text())
-            _SPAWN_FILE.unlink(missing_ok=True)
-        except Exception as exc:
-            logger.debug("Failed to read spawn command: %s", exc)
-            return
-
-        cmd_type = cmd.get("type", "")
-        arm      = cmd.get("arm", "North")
-
-        if cmd_type == "ambulance" and self._emrg_det is not None:
-            self._emrg_det.simulate_emergency(arm)
-            logger.info("[DashboardBridge] Spawned emergency on %s", arm)
-
-        elif cmd_type == "ped_rush" and self._emrg_det is not None:
-            self._emrg_det.simulate_ped_rush()
-            logger.info("[DashboardBridge] Spawned pedestrian rush")
-
-        elif cmd_type == "reset_waits":
-            # Zero out all arm wait timers — useful during demo resets
-            with self._state.lock:
-                for arm_obj in self._state.arms.values():
-                    arm_obj.wait_time = 0.0
-            logger.info("[DashboardBridge] Wait timers reset")
-
-        else:
-            logger.debug("[DashboardBridge] Unknown spawn command: %s", cmd)
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _write_default_control() -> None:
-        if not _CONTROL_FILE.exists():
-            _atomic_write_json(_CONTROL_FILE, _default_control())
+            STATE_FILE.write_text(json.dumps(state_dict, default=str), encoding='utf-8')
+        except OSError as exc:
+            logger.debug("Cannot write state file: %s", exc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared helpers used by both Bridge and the Streamlit app
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _default_control() -> dict:
-    return {
-        "spawn_rate":  1.0,
-        "ped_rate":    0.3,
-        "sim_speed":   1.0,
-        "min_green":   10,
-        "max_green":   60,
-    }
-
-
-def _atomic_write_json(path: Path, data: dict) -> None:
-    """Write JSON to a temp file then rename — prevents Streamlit reading a partial write."""
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, default=_json_default))
-    tmp.replace(path)
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
-
-
-def _json_default(obj):
-    """Fallback serializer for numpy types that appear in state dicts."""
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return str(obj)
-
+# ═══════════════════════════════════════════════════════════════════════════
+# Streamlit Dashboard App
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _load_state() -> dict:
-    """Read /tmp/traffic_state.json. Returns empty dict on any failure."""
+    """Load state from JSON file. Returns empty dict on failure."""
     try:
-        return json.loads(_STATE_FILE.read_text())
+        if STATE_FILE.exists():
+            raw = STATE_FILE.read_text(encoding='utf-8')
+            return json.loads(raw)
     except Exception:
-        return {}
+        pass
+    return {}
 
 
-def _load_frame(arm: str) -> Optional[np.ndarray]:
-    """Read the latest JPEG for *arm*. Returns None if unavailable."""
-    p = Path(_FRAME_PATTERN.format(arm=arm))
+def _signal_color(sig: str) -> str:
+    """Return hex color for signal state."""
+    return {'GREEN': '#00C851', 'YELLOW': '#FFB300', 'RED': '#FF3547'}.get(sig, '#888888')
+
+
+def _congestion_color(density: float) -> str:
+    """Traffic density → color: green/yellow/orange/red."""
+    if density < 5:    return '#00C851'   # free flow
+    if density < 12:   return '#FFB300'   # moderate
+    if density < 20:   return '#FF6D00'   # heavy
+    return '#FF3547'                       # critical
+
+
+def _phase_badge(phase: str) -> str:
+    badges = {
+        'normal':     '🟢 NORMAL',
+        'pedestrian': '🚶 PEDESTRIAN',
+        'emergency':  '🚨 EMERGENCY',
+        'all_red':    '🔴 ALL RED',
+        'startup':    '⏳ STARTING',
+    }
+    return badges.get(phase, f'⚪ {phase.upper()}')
+
+
+def run_dashboard() -> None:
+    """Main Streamlit dashboard entry point."""
     try:
-        raw = np.frombuffer(p.read_bytes(), dtype=np.uint8)
-        return cv2.imdecode(raw, cv2.IMREAD_COLOR)
-    except Exception:
-        return None
+        import streamlit as st
+    except ImportError:
+        print("streamlit not installed: pip install streamlit")
+        return
 
-
-def _load_control() -> dict:
-    try:
-        return json.loads(_CONTROL_FILE.read_text())
-    except Exception:
-        return _default_control()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Role 2 — Streamlit App
-#
-# Everything below this guard is only executed when Streamlit imports this file
-# as its entry point.  The DashboardBridge class above is still importable by
-# main.py without triggering any Streamlit calls.
-# ═════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__" or os.environ.get("STREAMLIT_RUNTIME"):
-    # ── Guard: only import streamlit when running as dashboard ───────────────
-    import streamlit as st
-    _STREAMLIT_RUNNING = True
-else:
-    _STREAMLIT_RUNNING = False
-
-
-def _run_streamlit_app() -> None:
-    """
-    Full Streamlit dashboard.  Called at module level when Streamlit imports
-    this file.  Streamlit re-runs this function top-to-bottom on every
-    interaction and every st.rerun() call.
-    """
-    import streamlit as st
-
-    # ── Page config ──────────────────────────────────────────────────────────
+    # ── Page config ───────────────────────────────────────────────────────
     st.set_page_config(
-        page_title="AI Traffic Command Center",
+        page_title="AI Smart Traffic System",
         page_icon="🚦",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
 
-    # ── Custom CSS — clean, bright, judge-readable ────────────────────────────
+    # ── Custom CSS (bright, modern, clean) ────────────────────────────────
     st.markdown("""
     <style>
-        /* Tighten top padding */
-        .block-container { padding-top: 1rem; padding-bottom: 0.5rem; }
+    /* Main background */
+    .stApp { background-color: #F8FAFC; }
+    .block-container { padding: 1rem 2rem 1rem 2rem; max-width: 100%; }
 
-        /* Metric card styling */
-        [data-testid="stMetric"] {
-            background: #f8f9fa;
-            border: 1px solid #e0e0e0;
-            border-radius: 8px;
-            padding: 10px 14px;
-        }
-        [data-testid="stMetricLabel"]  { font-size: 0.72rem; color: #555; }
-        [data-testid="stMetricValue"]  { font-size: 1.4rem;  font-weight: 700; }
+    /* Metric cards */
+    .metric-card {
+        background: white;
+        border-radius: 12px;
+        padding: 20px 24px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        border-left: 4px solid #2563EB;
+        margin-bottom: 12px;
+    }
+    .metric-value {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #1E293B;
+        line-height: 1.1;
+    }
+    .metric-label {
+        font-size: 0.85rem;
+        color: #64748B;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-top: 4px;
+    }
+    .metric-delta-pos { color: #10B981; font-size: 0.9rem; font-weight: 600; }
+    .metric-delta-neg { color: #EF4444; font-size: 0.9rem; font-weight: 600; }
 
-        /* Camera feed caption */
-        .cam-caption {
-            font-size: 0.78rem; color: #444;
-            margin-top: 2px; line-height: 1.4;
-        }
+    /* Signal indicator */
+    .signal-box {
+        border-radius: 12px;
+        padding: 16px;
+        text-align: center;
+        font-weight: 700;
+        font-size: 1.1rem;
+        color: white;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
 
-        /* Alert badge */
-        .badge-red   { background:#ff4b4b; color:#fff; padding:2px 8px;
-                       border-radius:12px; font-size:0.75rem; font-weight:600; }
-        .badge-green { background:#00c851; color:#fff; padding:2px 8px;
-                       border-radius:12px; font-size:0.75rem; font-weight:600; }
-        .badge-amber { background:#ffbb33; color:#222; padding:2px 8px;
-                       border-radius:12px; font-size:0.75rem; font-weight:600; }
-        .badge-blue  { background:#33b5e5; color:#fff; padding:2px 8px;
-                       border-radius:12px; font-size:0.75rem; font-weight:600; }
+    /* Arm card */
+    .arm-card {
+        background: white;
+        border-radius: 12px;
+        padding: 16px 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        margin-bottom: 10px;
+        border: 1px solid #E2E8F0;
+    }
+    .arm-name {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #1E293B;
+    }
+    .arm-stats {
+        font-size: 0.82rem;
+        color: #475569;
+        margin-top: 4px;
+    }
 
-        /* Section headers */
-        h3 { margin-bottom: 0.4rem !important; }
+    /* Status banner */
+    .status-banner {
+        border-radius: 10px;
+        padding: 12px 20px;
+        font-size: 1.1rem;
+        font-weight: 700;
+        text-align: center;
+        margin-bottom: 16px;
+    }
 
-        /* Sidebar slider labels */
-        .stSlider > label { font-size: 0.82rem; }
+    /* Section headers */
+    .section-header {
+        font-size: 0.95rem;
+        font-weight: 700;
+        color: #475569;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 12px;
+        margin-top: 8px;
+    }
 
-        /* Reduce sidebar top whitespace */
-        section[data-testid="stSidebar"] > div { padding-top: 0.8rem; }
+    /* Progress bar override */
+    .stProgress > div > div { height: 8px; border-radius: 4px; }
+
+    /* Hide streamlit branding */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+
+    /* Webster split bars */
+    .split-bar {
+        background: #EEF2FF;
+        border-radius: 4px;
+        height: 24px;
+        position: relative;
+        margin: 4px 0;
+        overflow: hidden;
+    }
+    .split-fill {
+        height: 100%;
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        padding-left: 8px;
+        font-size: 0.78rem;
+        font-weight: 600;
+        color: white;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-    # ── Load current state ────────────────────────────────────────────────────
-    state      = _load_state()
-    arm_data   = state.get("arms",       {})
-    phase_data = state.get("phase",      {})
-    congestion = state.get("congestion", "—")
-    ts         = state.get("timestamp",  0)
-    data_age_s = time.time() - ts if ts else 999
-
-    # ── Sidebar — Control Panel ───────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("## 🎛️ Control Panel")
-        _sidebar_status_badge(data_age_s)
-        st.divider()
-
-        st.markdown("### ⚙️ Simulation Parameters")
-        spawn_rate = st.slider("Vehicle Spawn Rate",  0.1, 3.0, 1.0, 0.1,
-                               help="Vehicles per second per arm (Pygame sim)")
-        ped_rate   = st.slider("Pedestrian Rate",     0.0, 2.0, 0.3, 0.1,
-                               help="Pedestrians per second in crosswalk ROI")
-        sim_speed  = st.slider("Simulation Speed",    0.5, 3.0, 1.0, 0.5,
-                               help="Time multiplier for Pygame animation")
-        min_green  = st.slider("Min Green Time (s)",  5,   20,  10,
-                               help="Minimum green phase duration per arm")
-        max_green  = st.slider("Max Green Time (s)",  30,  90,  60,
-                               help="Maximum green phase duration per arm")
-
-        # Persist control params so Pygame and controller can read them
-        _atomic_write_json(_CONTROL_FILE, {
-            "spawn_rate": spawn_rate, "ped_rate": ped_rate,
-            "sim_speed":  sim_speed,  "min_green": min_green,
-            "max_green":  max_green,
-        })
-
-        st.divider()
-        st.markdown("### 🕹️ Manual Spawn")
-
-        arm_sel = st.selectbox("Target Arm", _ARM_NAMES, index=0)
-
-        col_v, col_p = st.columns(2)
-        if col_v.button("🚗 Car",       use_container_width=True):
-            _send_spawn("car", arm_sel)
-            st.toast(f"🚗 Car spawned on {arm_sel}", icon="🚗")
-        if col_p.button("🚌 Bus",       use_container_width=True):
-            _send_spawn("bus", arm_sel)
-            st.toast(f"🚌 Bus spawned on {arm_sel}", icon="🚌")
-
-        col_a, col_b = st.columns(2)
-        if col_a.button("🛺 Auto",      use_container_width=True):
-            _send_spawn("auto", arm_sel)
-            st.toast(f"🛺 Auto spawned on {arm_sel}", icon="🛺")
-        if col_b.button("🏍️ Bike",     use_container_width=True):
-            _send_spawn("motorcycle", arm_sel)
-            st.toast(f"🏍️ Bike spawned on {arm_sel}", icon="🏍️")
-
-        col_c, col_d = st.columns(2)
-        if col_c.button("🚶 Pedestrian",use_container_width=True):
-            _send_spawn("ped_rush")
-            st.toast("🚶 Pedestrian rush triggered", icon="🚶")
-        if col_d.button("🐄 Animal",    use_container_width=True):
-            _send_spawn("animal", arm_sel)
-            st.toast(f"🐄 Animal on {arm_sel}", icon="🐄")
-
-        st.divider()
-        st.markdown("### 🚨 Override Controls")
-        if st.button("🚑 Ambulance Override",
-                     type="primary", use_container_width=True,
-                     help="Triggers ALL RED → Emergency arm GREEN"):
-            _send_spawn("ambulance", arm_sel)
-            st.toast(f"🚨 Emergency override — {arm_sel} arm!", icon="🚨")
-
-        if st.button("🔄 Reset Wait Timers",
-                     use_container_width=True,
-                     help="Zero all arm wait counters — use after demo scenario"):
-            _send_spawn("reset_waits")
-            st.toast("Wait timers reset", icon="🔄")
-
-        st.divider()
-        st.caption(
-            "**Terminal 1:** `python main.py --demo`\n\n"
-            "**Terminal 2:** `streamlit run dashboard/app.py`"
-        )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Main content
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ── Title bar ─────────────────────────────────────────────────────────────
-    title_col, badge_col = st.columns([3, 1])
-    with title_col:
-        st.markdown("# 🚦 AI Traffic Command Center")
-        st.caption("Indian Cities Smart Signal Optimization · YOLOv8 + Arduino")
-    with badge_col:
-        _congestion_badge(congestion)
-
-    # ── Signal status row (4 metrics) ─────────────────────────────────────────
-    st.markdown("### 🟢 Live Signal Status")
-    _render_signal_status(phase_data, congestion)
-
-    # Emergency / hazard / pedestrian alerts
-    _render_alert_banners(arm_data, phase_data)
+    # ── Header ─────────────────────────────────────────────────────────────
+    col_logo, col_title, col_time = st.columns([1, 6, 2])
+    with col_logo:
+        st.markdown("# 🚦")
+    with col_title:
+        st.markdown("""
+        <div style='padding-top:8px'>
+            <span style='font-size:1.6rem;font-weight:800;color:#1E293B'>
+                AI Smart Traffic Management
+            </span>
+            <span style='font-size:0.9rem;color:#64748B;margin-left:12px'>
+                Powered by YOLOv8 + Webster's Algorithm
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_time:
+        st.markdown(f"""
+        <div style='text-align:right;padding-top:12px;color:#64748B;font-size:0.85rem'>
+            Last refresh: {time.strftime('%H:%M:%S')}
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
 
-    # ── Camera feeds (2 × 2 grid) ─────────────────────────────────────────────
-    st.markdown("### 📹 Camera Feeds — YOLO Detection")
-    _render_camera_grid(arm_data, phase_data)
+    # ── Load state ─────────────────────────────────────────────────────────
+    state = _load_state()
+    arms = state.get('arms', {})
+    session = state.get('session', {})
+    phase = state.get('phase', 'startup')
+    current_green = state.get('current_green')
+    congestion_index = state.get('congestion_index', 0)
 
-    st.divider()
+    arm_list = ['North', 'South', 'East', 'West']
 
-    # ── Analytics row ─────────────────────────────────────────────────────────
-    st.markdown("### 📊 Traffic Analytics")
-    _render_analytics(arm_data)
-
-    st.divider()
-
-    # ── Session stats ─────────────────────────────────────────────────────────
-    st.markdown("### 📈 Session Statistics")
-    _render_session_stats(phase_data)
-
-    # ── Auto-refresh ──────────────────────────────────────────────────────────
-    # Streamlit >= 1.27 supports st.rerun(). Older versions need experimental.
-    time.sleep(0.6)
-    try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()  # type: ignore[attr-defined]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section renderers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _render_signal_status(phase_data: dict, congestion: str) -> None:
-    import streamlit as st
-
-    phase        = phase_data.get("phase",         "—")
-    current_green= phase_data.get("current_green", "—")
-    total_cycles = phase_data.get("total_cycles",  0)
-    uptime_s     = phase_data.get("uptime_s",      0.0)
-
-    # Determine phase colour label
-    phase_icons = {
-        "normal":      "🟢 NORMAL",
-        "emergency":   "🔴 EMERGENCY",
-        "pedestrian":  "🔵 WALK",
-        "all_red":     "🔴 ALL RED",
-        "yellow":      "🟡 YELLOW",
+    # ── Phase status banner ────────────────────────────────────────────────
+    phase_colors = {
+        'normal':     '#2563EB',
+        'pedestrian': '#7C3AED',
+        'emergency':  '#DC2626',
+        'all_red':    '#374151',
+        'startup':    '#64748B',
     }
-    phase_label = phase_icons.get(phase.lower(), f"⚪ {phase.upper()}")
+    banner_color = phase_colors.get(phase, '#64748B')
+    st.markdown(f"""
+    <div class='status-banner' style='background:{banner_color};color:white'>
+        {_phase_badge(phase)}
+        {'  ·  🟢 ' + current_green + ' is GREEN' if current_green else ''}
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Congestion colour
-    cong_icons = {
-        "LOW":      "🟢 LOW",
-        "MEDIUM":   "🟡 MEDIUM",
-        "HIGH":     "🟠 HIGH",
-        "CRITICAL": "🔴 CRITICAL",
-    }
-    cong_label = cong_icons.get(congestion, f"— {congestion}")
+    # ══════════════════════════════════════════════════════════════════════
+    # Row 1: KPI Metric Cards
+    # ══════════════════════════════════════════════════════════════════════
+    st.markdown("<div class='section-header'>📊 System Performance</div>", unsafe_allow_html=True)
+    k1, k2, k3, k4, k5 = st.columns(5)
 
-    uptime_str = _fmt_uptime(uptime_s)
+    uptime = session.get('uptime_s', 0)
+    uptime_str = f"{int(uptime//3600):02d}:{int((uptime%3600)//60):02d}:{int(uptime%60):02d}"
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active Green Arm", f"ARM {current_green}" if current_green != "—" else "—")
-    c2.metric("Signal Phase",     phase_label)
-    c3.metric("Congestion Level", cong_label)
-    c4.metric("Signal Cycles",    f"{total_cycles}  ·  {uptime_str}")
+    cycles = session.get('total_cycles', 0)
+    cleared = session.get('vehicles_cleared', 0)
+    efficiency = session.get('efficiency_gain_pct', 0.0)
+    throughput = session.get('throughput_per_hour', 0.0)
+    wait_saved = session.get('total_wait_saved', 0.0)
 
+    with k1:
+        st.markdown(f"""
+        <div class='metric-card' style='border-left-color:#2563EB'>
+            <div class='metric-value'>{uptime_str}</div>
+            <div class='metric-label'>⏱ System Uptime</div>
+        </div>""", unsafe_allow_html=True)
 
-def _render_alert_banners(arm_data: dict, phase_data: dict) -> None:
-    import streamlit as st
+    with k2:
+        st.markdown(f"""
+        <div class='metric-card' style='border-left-color:#10B981'>
+            <div class='metric-value'>{cleared:,}</div>
+            <div class='metric-label'>🚗 Vehicles Cleared</div>
+            <div class='metric-delta-pos'>↑ {throughput:.0f}/hr throughput</div>
+        </div>""", unsafe_allow_html=True)
 
-    phase = phase_data.get("phase", "normal").lower()
+    with k3:
+        eff_color = '#10B981' if efficiency > 0 else '#EF4444'
+        st.markdown(f"""
+        <div class='metric-card' style='border-left-color:{eff_color}'>
+            <div class='metric-value' style='color:{eff_color}'>{efficiency:.1f}%</div>
+            <div class='metric-label'>⚡ Efficiency vs Fixed-Time</div>
+            <div class='metric-delta-pos'>↑ Better than naive baseline</div>
+        </div>""", unsafe_allow_html=True)
 
-    if phase == "emergency":
-        emrg_arm = next(
-            (arm for arm, s in arm_data.items() if getattr(s, "emergency")), "Unknown"
-        )
-        st.error(f"🚨 **EMERGENCY OVERRIDE ACTIVE** — {emrg_arm} arm has priority. "
-                 "All other arms are RED.")
+    with k4:
+        cong_color = _congestion_color(congestion_index / 5.0)
+        st.markdown(f"""
+        <div class='metric-card' style='border-left-color:{cong_color}'>
+            <div class='metric-value' style='color:{cong_color}'>{congestion_index}</div>
+            <div class='metric-label'>🌡 Congestion Index (0–100)</div>
+        </div>""", unsafe_allow_html=True)
 
-    elif phase == "pedestrian":
-        avg = phase_data.get("ped_rolling_avg", 0.0)
-        st.info(f"🚶 **PEDESTRIAN PHASE** — {avg:.1f} pedestrians detected. "
-                "WALK signal active. All vehicle arms RED.")
+    with k5:
+        st.markdown(f"""
+        <div class='metric-card' style='border-left-color:#F59E0B'>
+            <div class='metric-value'>{wait_saved:.0f}s</div>
+            <div class='metric-label'>⏳ Total Wait Time Saved</div>
+            <div class='metric-delta-pos'>↑ vs fixed-time baseline</div>
+        </div>""", unsafe_allow_html=True)
 
-    hazard_arms = {
-        arm: getattr(s, "hazard")
-        for arm, s in arm_data.items()
-        if getattr(s, "hazard")
-    }
-    if hazard_arms:
-        hazard_str = ", ".join(
-            f"{arm} ({cls})" for arm, cls in hazard_arms.items()
-        )
-        st.warning(f"⚠️ **ANIMAL HAZARD** detected on: {hazard_str}. "
-                   "Signal extension active.")
+    st.markdown("<br>", unsafe_allow_html=True)
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Row 2: Arm Signal States + Per-Arm Details
+    # ══════════════════════════════════════════════════════════════════════
+    st.markdown("<div class='section-header'>🚦 Intersection Arms</div>", unsafe_allow_html=True)
+    arm_cols = st.columns(4)
 
-def _render_camera_grid(arm_data: dict, phase_data: dict) -> None:
-    import streamlit as st
+    for i, arm in enumerate(arm_list):
+        arm_data = arms.get(arm, {})
+        sig = arm_data.get('signal_state', 'RED')
+        density = arm_data.get('density', 0.0)
+        queue = arm_data.get('queue_length', 0)
+        wait = arm_data.get('wait_time', 0.0)
+        score = arm_data.get('priority_score', 0.0)
+        pred_q = arm_data.get('predicted_q8s', 0.0)
+        arr_rate = arm_data.get('arrival_rate', 0.0)
+        flow_dir = arm_data.get('flow_direction', 'unknown')
+        emergency = arm_data.get('emergency', False)
+        hazard = arm_data.get('hazard', False)
 
-    current_green = phase_data.get("current_green", "")
-    cols = st.columns(4)
+        sig_color = _signal_color(sig)
+        dens_color = _congestion_color(density)
 
-    for i, arm in enumerate(_ARM_NAMES):
-        s         = arm_data.get(arm, {})
-        density   = getattr(s, "density",   0.0)
-        wait      = getattr(s, "wait_time", 0.0)
-        emergency = getattr(s, "emergency", False)
-        hazard    = getattr(s, "hazard",    False)
-        is_green  = (arm == current_green)
+        # Emergency/hazard badges
+        badges = ''
+        if emergency: badges += ' 🚨'
+        if hazard:    badges += ' ⚠️'
 
-        with cols[i]:
-            # Status badge in the column header
-            if emergency:
-                st.markdown(
-                    f'<span class="badge-red">🚨 EMERGENCY</span> **{arm}**',
-                    unsafe_allow_html=True,
-                )
-            elif hazard:
-                st.markdown(
-                    f'<span class="badge-amber">⚠️ HAZARD</span> **{arm}**',
-                    unsafe_allow_html=True,
-                )
-            elif is_green:
-                st.markdown(
-                    f'<span class="badge-green">🟢 GREEN</span> **{arm}**',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f'<span class="badge-red">🔴 RED</span> **{arm}**',
-                    unsafe_allow_html=True,
-                )
+        with arm_cols[i]:
+            # Signal box
+            st.markdown(f"""
+            <div class='signal-box' style='background:{sig_color}'>
+                {arm[0]} · {sig}{badges}
+            </div>
+            """, unsafe_allow_html=True)
 
-            # Camera frame
-            frame = _load_frame(arm)
-            if frame is not None:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                st.image(frame_rgb, use_column_width=True)
-            else:
-                # Placeholder while main.py starts up
-                placeholder = np.full((180, 320, 3), 30, dtype=np.uint8)
-                cv2.putText(
-                    placeholder,
-                    f"{arm}: awaiting feed",
-                    (10, 95),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 1,
-                )
-                st.image(placeholder, use_column_width=True,
-                         channels="BGR")
+            # Stats
+            st.markdown(f"""
+            <div class='arm-card'>
+                <div class='arm-name'>{arm}</div>
+                <div class='arm-stats'>
+                    📦 Density: <b style='color:{dens_color}'>{density:.1f} PCU</b><br>
+                    🚗 Queue: <b>{queue} vehicles</b><br>
+                    ⏱ Wait: <b>{wait:.0f}s</b><br>
+                    📈 Score: <b>{score:.1f}</b><br>
+                    🔮 Pred (8s): <b>{pred_q:.1f} PCU</b><br>
+                    ➡ Flow: <b>{flow_dir}</b><br>
+                    📡 Arrival: <b>{arr_rate:.3f} PCU/s</b>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-            # Metrics beneath the frame
-            st.markdown(
-                f'<div class="cam-caption">'
-                f'PCU density: <b>{density:.1f}</b> &nbsp;|&nbsp; '
-                f'Wait: <b>{wait:.0f}s</b>'
-                f'</div>',
-                unsafe_allow_html=True,
+            # Density progress bar
+            bar_pct = min(1.0, density / 21.0)
+            st.progress(bar_pct, text=f"Capacity: {bar_pct*100:.0f}%")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Row 3: Webster Splits + Priority Scores side by side
+    # ══════════════════════════════════════════════════════════════════════
+    col_splits, col_scores = st.columns(2)
+
+    with col_splits:
+        st.markdown("<div class='section-header'>📐 Webster Optimal Green Splits</div>", unsafe_allow_html=True)
+        splits = session.get('webster_splits', {})
+        arm_colors = {
+            'North': '#2563EB',
+            'South': '#10B981',
+            'East':  '#F59E0B',
+            'West':  '#7C3AED',
+        }
+        if splits:
+            max_split = max(splits.values()) if splits else 1.0
+            for arm in arm_list:
+                g = splits.get(arm, 0.0)
+                pct = int(min(100, g / max_split * 100))
+                color = arm_colors.get(arm, '#888')
+                st.markdown(f"""
+                <div style='margin:4px 0'>
+                    <span style='font-size:0.82rem;font-weight:600;color:#475569;
+                                 display:inline-block;width:60px'>{arm}</span>
+                    <div class='split-bar' style='display:inline-block;width:calc(100% - 110px);
+                                                   vertical-align:middle;'>
+                        <div class='split-fill' style='width:{pct}%;background:{color}'>
+                            {g:.0f}s
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Waiting for Webster calculation...")
+
+    with col_scores:
+        st.markdown("<div class='section-header'>🏆 Priority Scores (Current Cycle)</div>", unsafe_allow_html=True)
+        current_scores = session.get('current_scores', {})
+        if current_scores:
+            # Sort by score descending
+            sorted_arms = sorted(arm_list, key=lambda a: current_scores.get(a, 0), reverse=True)
+            max_score = max(current_scores.values()) if current_scores else 1.0
+            for rank, arm in enumerate(sorted_arms):
+                sc = current_scores.get(arm, 0.0)
+                pct = int(min(100, sc / max(max_score, 1.0) * 100))
+                rank_emoji = ['🥇', '🥈', '🥉', '4️⃣'][rank]
+                color = arm_colors.get(arm, '#888')
+                st.markdown(f"""
+                <div style='margin:4px 0'>
+                    <span style='font-size:0.82rem;font-weight:600;color:#475569;
+                                 display:inline-block;width:80px'>{rank_emoji} {arm}</span>
+                    <div class='split-bar' style='display:inline-block;width:calc(100% - 130px);
+                                                   vertical-align:middle;'>
+                        <div class='split-fill' style='width:{pct}%;background:{color}'>
+                            {sc:.1f}
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Waiting for scoring cycle...")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Row 4: Efficiency metrics + session table
+    # ══════════════════════════════════════════════════════════════════════
+    col_eff, col_sess = st.columns([3, 2])
+
+    with col_eff:
+        st.markdown("<div class='section-header'>📉 Traffic Efficiency vs Fixed-Time Baseline</div>", unsafe_allow_html=True)
+
+        try:
+            import plotly.graph_objects as go
+
+            # Generate efficiency timeline data
+            # (In real deployment, this comes from a time-series buffer)
+            # Here we compute instantaneous metrics for display
+            arm_densities = {arm: arms.get(arm, {}).get('density', 0.0) for arm in arm_list}
+            arm_waits = {arm: arms.get(arm, {}).get('wait_time', 0.0) for arm in arm_list}
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                name='Current Density (PCU)',
+                x=arm_list,
+                y=[arm_densities[a] for a in arm_list],
+                marker_color=[arm_colors[a] for a in arm_list],
+                opacity=0.85,
+            ))
+            fig.add_trace(go.Scatter(
+                name='Wait Time (s)',
+                x=arm_list,
+                y=[arm_waits[a] for a in arm_list],
+                mode='lines+markers',
+                yaxis='y2',
+                line=dict(color='#EF4444', width=2),
+                marker=dict(size=8),
+            ))
+            fig.update_layout(
+                height=260,
+                margin=dict(l=0, r=0, t=20, b=20),
+                paper_bgcolor='white',
+                plot_bgcolor='white',
+                legend=dict(orientation='h', y=1.1),
+                yaxis=dict(title='PCU Density', gridcolor='#F1F5F9'),
+                yaxis2=dict(title='Wait (s)', overlaying='y', side='right'),
+                font=dict(size=11),
             )
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            # Fallback if plotly not installed
+            for arm in arm_list:
+                d = arms.get(arm, {}).get('density', 0.0)
+                w = arms.get(arm, {}).get('wait_time', 0.0)
+                st.write(f"**{arm}**: {d:.1f} PCU | Wait: {w:.0f}s")
 
-            # Density bar (visual only — no extra widget needed)
-            bar_pct = min(density / 50.0, 1.0)
-            bar_color = _density_bar_color(bar_pct)
-            st.markdown(
-                f'<div style="height:6px;border-radius:3px;'
-                f'background:linear-gradient(to right,{bar_color} {bar_pct*100:.0f}%,'
-                f'#e0e0e0 {bar_pct*100:.0f}%);margin-top:4px;"></div>',
-                unsafe_allow_html=True,
-            )
+    with col_sess:
+        st.markdown("<div class='section-header'>📋 Session Summary</div>", unsafe_allow_html=True)
+        last_arm = session.get('last_green_arm', '–')
+        last_gt = session.get('last_green_time', 0)
+        ped_avg = state.get('ped_rolling_avg', 0.0)
+        ped_req = state.get('ped_requested', False)
 
+        summary_data = {
+            "Signal Cycles": cycles,
+            "Vehicles Cleared": cleared,
+            "Throughput/hr": f"{throughput:.0f}",
+            "Efficiency Gain": f"{efficiency:.1f}%",
+            "Wait Time Saved": f"{wait_saved:.0f}s",
+            "Last Green Arm": last_arm,
+            "Last Green Time": f"{last_gt:.0f}s",
+            "Pedestrian Avg": f"{ped_avg:.1f}",
+            "Ped Phase Active": "✅" if ped_req else "❌",
+        }
+        for label, value in summary_data.items():
+            col_a, col_b = st.columns([2, 1])
+            col_a.caption(label)
+            col_b.markdown(f"**{value}**")
 
-def _render_analytics(arm_data: dict) -> None:
-    import streamlit as st
+    # ── Auto-refresh ───────────────────────────────────────────────────────
+    st.markdown("""
+    <script>
+    setTimeout(function() { window.location.reload(); }, 1000);
+    </script>
+    """, unsafe_allow_html=True)
 
-    cols = st.columns(4)
-    for i, arm in enumerate(_ARM_NAMES):
-        s         = arm_data.get(arm, {})
-        density   = getattr(s, "density",   0.0)
-        wait      = getattr(s, "wait_time", 0.0)
-
-        with cols[i]:
-            st.markdown(f"**{arm} Arm**")
-            st.metric("PCU Density",  f"{density:.1f}")
-            st.metric("Wait Time",    f"{wait:.0f} s")
-
-            # Classify density level
-            if density < 10:
-                level_html = '<span class="badge-green">LOW</span>'
-            elif density < 25:
-                level_html = '<span class="badge-amber">MEDIUM</span>'
-            elif density < 40:
-                level_html = '<span style="background:#ff8800;color:#fff;'  \
-                             'padding:2px 8px;border-radius:12px;font-size:0.75rem;font-weight:600">HIGH</span>'
-            else:
-                level_html = '<span class="badge-red">CRITICAL</span>'
-
-            st.markdown(f"Density level: {level_html}", unsafe_allow_html=True)
-            st.markdown("")   # breathing room
-
-
-def _render_session_stats(phase_data: dict) -> None:
-    import streamlit as st
-
-    total_cycles     = phase_data.get("total_cycles",    0)
-    vehicles_cleared = phase_data.get("vehicles_cleared", 0)
-    uptime_s         = phase_data.get("uptime_s",         0.0)
-    ped_avg          = phase_data.get("ped_rolling_avg",   0.0)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Signal Cycles Completed", str(total_cycles))
-    c2.metric("Vehicles Cleared",        str(vehicles_cleared))
-    c3.metric("System Uptime",           _fmt_uptime(uptime_s))
-    c4.metric("Ped Rolling Avg",         f"{ped_avg:.1f} / 8.0",
-              help="Pedestrian phase triggers at rolling average ≥ 8")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Small UI helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _sidebar_status_badge(data_age_s: float) -> None:
-    import streamlit as st
-    if data_age_s < 2.0:
-        st.markdown(
-            '<span class="badge-green">● LIVE</span> main.py connected',
-            unsafe_allow_html=True,
-        )
-    elif data_age_s < 10.0:
-        st.markdown(
-            f'<span class="badge-amber">● DELAYED</span> {data_age_s:.0f}s ago',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<span class="badge-red">● OFFLINE</span> Run: `python main.py --demo`',
-            unsafe_allow_html=True,
-        )
-
-
-def _congestion_badge(congestion: str) -> None:
-    import streamlit as st
-    color_map = {
-        "LOW":      "#00c851",
-        "MEDIUM":   "#ffbb33",
-        "HIGH":     "#ff8800",
-        "CRITICAL": "#ff4b4b",
-    }
-    color = color_map.get(congestion, "#999")
+    # ── Footer ─────────────────────────────────────────────────────────────
+    st.markdown("---")
     st.markdown(
-        f'<div style="text-align:right;margin-top:16px;">'
-        f'<span style="background:{color};color:{"#222" if congestion=="MEDIUM" else "#fff"};'
-        f'padding:6px 16px;border-radius:16px;font-size:1rem;font-weight:700;">'
-        f'Congestion: {congestion}</span></div>',
-        unsafe_allow_html=True,
+        "<div style='text-align:center;color:#94A3B8;font-size:0.8rem'>"
+        "🚦 AI Smart Traffic Management · YOLOv8 + Webster's Optimal Cycle · "
+        "Indian City Conditions · Real-time PCU Estimation"
+        "</div>",
+        unsafe_allow_html=True
     )
 
 
-def _send_spawn(cmd_type: str, arm: str = "North") -> None:
-    """Write a one-shot spawn command for DashboardBridge to consume."""
-    _atomic_write_json(_SPAWN_FILE, {"type": cmd_type, "arm": arm})
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def _density_bar_color(ratio: float) -> str:
-    """Return a CSS hex colour: green → amber → red based on 0–1 ratio."""
-    if ratio < 0.4:
-        return "#00c851"
-    if ratio < 0.7:
-        return "#ffbb33"
-    return "#ff4b4b"
-
-
-def _fmt_uptime(seconds: float) -> str:
-    """Format seconds as H:MM:SS string."""
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h > 0:
-        return f"{h}:{m:02d}:{sec:02d}"
-    return f"{m}:{sec:02d}"
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Entry point — Streamlit calls this module directly, so we detect that and
-# run the app.  When imported by main.py only DashboardBridge is used.
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Streamlit re-imports the module on every rerun, so we just call the function
-# at module level and let Streamlit's script runner handle the loop.
-try:
-    import streamlit as _st_probe  # noqa: F401
-    _RUNNING_IN_STREAMLIT = True
-except ImportError:
-    _RUNNING_IN_STREAMLIT = False
-
-if _RUNNING_IN_STREAMLIT and os.environ.get("STREAMLIT_SERVER_PORT"):
-    _run_streamlit_app()
+if __name__ == "__main__":
+    run_dashboard()

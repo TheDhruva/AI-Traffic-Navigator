@@ -185,23 +185,23 @@ class EmergencyDetector:
         """
         result = EmergencyResult()
 
-        ped_count_this_frame = 0
+        ped_count_this_frame: int = 0
 
         for det in detections:
 
             # ── Emergency vehicle ────────────────────────────────────────
-            if det.class_name in self._emergency_classes:
+            if det.cls_name in self._emergency_classes:
                 self._handle_emergency(det, result)
                 continue
 
             # ── Pedestrian (PED ROI only) ────────────────────────────────
-            if det.class_name == 'person':
+            if det.cls_name == 'person':
                 if self._point_in_roi('PED', det.cx, det.cy):
-                    ped_count_this_frame += 1
+                    ped_count_this_frame = ped_count_this_frame + 1  # pyre-ignore
                 continue
 
             # ── Hazard animal ────────────────────────────────────────────
-            if det.class_name in self._hazard_classes:
+            if det.cls_name in self._hazard_classes:
                 self._handle_hazard(det)
 
         # ── Decay emergency hold-off ─────────────────────────────────────
@@ -324,22 +324,22 @@ class EmergencyDetector:
             logger.warning(
                 "Emergency %s detected but couldn't assign to any arm "
                 "(cx=%.0f cy=%.0f)",
-                det.class_name, det.cx, det.cy,
+                det.cls_name, det.cx, det.cy,
             )
             return
 
         logger.warning(
             "EMERGENCY OVERRIDE: %s detected on %s arm (conf=%.2f)",
-            det.class_name, arm, det.confidence,
+            det.cls_name, arm, det.confidence,
         )
 
         self._active_emergency_arm   = arm
-        self._active_emergency_class = det.class_name
+        self._active_emergency_class = det.cls_name
         self._emergency_holdoff      = self.HOLD_FRAMES
 
         result.emergency_detected = True
         result.emergency_arm      = arm
-        result.emergency_class    = det.class_name
+        result.emergency_class    = det.cls_name
         result.emergency_conf     = det.confidence
 
     def _handle_hazard(self, det) -> None:
@@ -350,12 +350,12 @@ class EmergencyDetector:
 
         prev_count = self._hazard_countdown.get(arm, 0)
         self._hazard_countdown[arm] = self._hazard_clear_n
-        self._hazard_class[arm]     = det.class_name
+        self._hazard_class[arm]     = det.cls_name
 
         if prev_count == 0:
             logger.warning(
                 "HAZARD: %s detected on %s arm (conf=%.2f)",
-                det.class_name, arm, det.confidence,
+                det.cls_name, arm, det.confidence,
             )
 
     def _point_in_roi(self, roi_name: str, cx: float, cy: float) -> bool:
@@ -445,9 +445,9 @@ if __name__ == '__main__':
         detections = detector.detect(processed)
         result     = emerg_det.update(detections)
 
-        frame_n += 1
+        frame_n += 1  # pyre-ignore
         if frame_n % 30 == 0:
-            fps = 30.0 / (time.time() - t0)
+            fps = 30.0 / (time.time() - t0)  # pyre-ignore
             t0  = time.time()
 
         # Console log for any events

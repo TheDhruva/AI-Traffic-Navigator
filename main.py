@@ -185,31 +185,12 @@ class DetectionThread(threading.Thread):
                 time.sleep(0.1)
                 continue
 
-            # For now, use North arm as the primary frame for display.
-            # In a full system, you could stitch all 4 or process each independently.
-            for arm, frame in frames.items():
+            # For now, use North arm as the primary frame for display and processing.
+            # In an overhead view system, one camera sees all 4 arms.
+            frame = frames.get("North")
 
-                if frame is None:
-                    continue
-
-                quality = check_frame_quality(frame)
-                if not quality['is_usable']:
-                    continue
-
-                processed = frame
-
-                t0 = time.perf_counter()
-                detections = self._detector.detect(processed)
-                self._inference_ms = (time.perf_counter() - t0) * 1000
-
-                density_result = self._density.update(detections)
-                flow_result = self._flow.update(processed)
-                emrg_result = self._emergency.update(detections)
-
-                with self._state.lock:
-                    self._state.update_from_density(density_result)
-                    self._state.update_from_flow(flow_result)
-                    self._state.update_from_emergency(emrg_result)
+            if frame is None:
+                continue
 
             # ── Quality gate ───────────────────────────────────────────────
             quality = check_frame_quality(frame)
@@ -270,11 +251,11 @@ class DetectionThread(threading.Thread):
 
         arm_snap = {
             arm: {
-                "signal": s.signal,
-                "density": s.density,
-                "wait_time": s.wait_time,
-                "emergency": s.emergency,
-                "hazard": s.hazard,
+                "signal": s.get("signal", "R"),
+                "density": s.get("density", 0.0),
+                "wait_time": s.get("wait_time", 0.0),
+                "emergency": s.get("emergency", False),
+                "hazard": s.get("hazard", False),
             }
             for arm, s in arm_snap_raw.items()
         }
@@ -424,7 +405,7 @@ def main() -> None:
         elif args.source:
             source = args.source
         elif args.demo:
-            source = VIDEO_SOURCE
+            source = os.path.join("assets", "test_video.mp4")
         else:
             source = VIDEO_SOURCE
 
@@ -510,6 +491,7 @@ def main() -> None:
             sim = create_simulation(
                 state=state,
                 emergency_detector=detection_thread.emergency_detector,
+                camera_manager=camera_mgr,
             )
             logger.info("Pygame simulation starting (main thread)")
             try:

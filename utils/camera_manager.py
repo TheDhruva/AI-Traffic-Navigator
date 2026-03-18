@@ -120,6 +120,7 @@ class _ArmReader:
         self._lock        = lock
         self._running     = running
         self._apply_clahe = apply_clahe
+        self._force_reopen= False
 
         # Human-readable source label for logs / dashboard
         self._src_label = str(source) if isinstance(source, str) else f"webcam:{source}"
@@ -167,6 +168,10 @@ class _ArmReader:
             fps_t0             = time.perf_counter()
 
             while self._running.is_set():
+                if self._force_reopen:
+                    self._force_reopen = False
+                    break
+
                 ret, raw = cap.read()
 
                 if not ret:
@@ -525,6 +530,17 @@ class CameraManager:
                 ok = "✓" if h.is_usable else "✗"
                 parts.append(f"{arm[0]}:{ok}{h.fps:.0f}fps")
         return "  ".join(parts)
+
+    def switch_all_sources(self, new_source: ArmSource) -> None:
+        """Dynamically switch all arms to a new video source without stopping the manager."""
+        with self._lock:
+            for arm, reader in self._readers.items():
+                reader._source = new_source
+                reader._src_label = str(new_source) if isinstance(new_source, str) else f"webcam:{new_source}"
+                reader._force_reopen = True
+            for arm in ARM_NAMES:
+                self._sources[arm] = new_source
+            logger.info("CameraManager switched all sources to: %s", new_source)
 
     # ------------------------------------------------------------------
     # Factory helpers

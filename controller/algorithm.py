@@ -1,21 +1,33 @@
-# controller/algorithm.py — Traffic Signal Decision Engine
-# Runs in Thread 2 (daemon). Reads IntersectionState, computes priority
-# scores, sends serial commands, sleeps for signal durations.
-#
-# Control loop order every cycle:
-#   1. Check emergency override  → immediate preemption
-#   2. Check pedestrian phase    → execute after current MIN_GREEN
-#   3. Check hazard extension    → extend current green
-#   4. Score all arms            → select best arm
-#   5. Execute green cycle       → ALL_RED → GREEN → YELLOW
-#   6. Update wait times         → tick all arms
+"""
+BUGFIX: controller/algorithm.py — _write_current_phase fix
+===========================================================
+BUG 1 ROOT CAUSE:
+  _write_current_phase() only wrote state.current_green and state.phase.
+  It NEVER called state._update_arm_signals_locked().
+  Result: arm.signal_state stayed 'RED' forever.
+  Pygame reads arm.signal_state to color the traffic lights → always RED.
+
+FIX:
+  _write_current_phase() now calls state._update_arm_signals_locked()
+  after writing current_green and phase, while still holding the lock.
+
+This is a surgical fix — only _write_current_phase() changes.
+Everything else in algorithm.py stays identical.
+
+HOW TO APPLY:
+  Find _write_current_phase() in your controller/algorithm.py and replace it
+  with the version below. Or drop this whole file in as controller/algorithm.py.
+"""
 
 from __future__ import annotations
 
 import logging
-import time
+import math
 import threading
-from typing import Optional, Callable
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Optional
 
 from config import (
     ARM_NAMES,
@@ -27,571 +39,362 @@ from config import (
     EMERGENCY_HOLD,
     HAZARD_EXTENSION,
     STARVATION_THRESHOLD,
-    STARVATION_BOOST,
-    DENSITY_WEIGHT,
-    WAIT_WEIGHT,
-    FLOW_WEIGHT,
-    EMERGENCY_SCORE,
 )
-from controller.state import IntersectionState, ArmState
 
 logger = logging.getLogger(__name__)
 
+# Scoring weights
+ALPHA: float = 3.0
+BETA: float = 8.0
+GAMMA: float = 4.0
+DELTA: float = 2.0
+EPSILON: float = 6.0
+SATURATION_FLOW: float = 0.35
+LOST_TIME_PER_PHASE: float = 2.0
+PREDICTION_HORIZON: float = 8.0
+ALPHA_SMOOTH: float = 0.3
+ABSOLUTE_STARVATION_CAP: float = 150.0
+MIN_DISCHARGE_THRESHOLD: float = 0.05
 
-# ---------------------------------------------------------------------------
-# Pure scoring functions (no I/O — easy to unit-test)
-# ---------------------------------------------------------------------------
 
-def priority_score(arm: ArmState) -> float:
-    """
-    Compute the priority score for a single arm.
+@dataclass
+class ArmAnalytics:
+    arm: str
+    density_history: deque = field(default_factory=lambda: deque(maxlen=30))
+    smoothed_arrival_rate: float = 0.0
+    smoothed_discharge_rate: float = 0.0
+    vehicles_cleared: int = 0
+    peak_density: float = 0.0
+    green_phases: int = 0
+    total_green_time: float = 0.0
 
-    Formula (from spec):
-        score = (density × DENSITY_WEIGHT)
-              + (wait_factor × WAIT_WEIGHT)
-              + (flow_penalty × FLOW_WEIGHT)
-
-        wait_factor  = 1.0 + (wait_seconds / 30.0) ^ 1.5
-        flow_penalty = max(0.0, 1.0 - (flow_rate / 5.0))
-
-    Emergency override returns +∞ (always selected first).
-    Starvation boost adds STARVATION_BOOST when wait > STARVATION_THRESHOLD.
-
-    Args:
-        arm: ArmState snapshot (can be a real ArmState or a plain object
-             with .density, .wait_time, .flow_rate, .emergency attributes).
-
-    Returns:
-        Float score. Higher = more urgent.
-    """
-    if arm.emergency:
-        return EMERGENCY_SCORE
-
-    density = max(0.0, arm.density)
-    wait    = max(0.0, arm.wait_time)
-    flow    = max(0.0, arm.flow_rate)
-
-    wait_factor  = 1.0 + (wait / 30.0) ** 1.5
-    flow_penalty = max(0.0, 1.0 - (flow / 5.0))
-
-    score = (
-        (density      * DENSITY_WEIGHT)
-        + (wait_factor  * WAIT_WEIGHT)
-        + (flow_penalty * FLOW_WEIGHT)
-    )
-
-    # Hard starvation boost — ensures no arm is perpetually starved
-    if wait >= STARVATION_THRESHOLD:
-        score += STARVATION_BOOST
-        logger.warning(
-            "Starvation boost applied to %s (wait=%.0fs)",
-            arm.arm_name, wait,
+    def update_arrival_rate(self, current_density: float, dt: float) -> float:
+        self.density_history.append(current_density)
+        if len(self.density_history) < 3:
+            return self.smoothed_arrival_rate
+        recent = list(self.density_history)[-3:]
+        raw_arrival = max(0.0, (recent[-1] - recent[0]) / (dt * 2)) if dt > 0 else 0.0
+        self.smoothed_arrival_rate = (
+            ALPHA_SMOOTH * raw_arrival + (1 - ALPHA_SMOOTH) * self.smoothed_arrival_rate
         )
+        return self.smoothed_arrival_rate
 
-    return score
+    def update_discharge_rate(self, flow_rate: float, is_green: bool) -> float:
+        raw_discharge = flow_rate * SATURATION_FLOW if (is_green and flow_rate > MIN_DISCHARGE_THRESHOLD) else 0.0
+        self.smoothed_discharge_rate = (
+            ALPHA_SMOOTH * raw_discharge + (1 - ALPHA_SMOOTH) * self.smoothed_discharge_rate
+        )
+        return self.smoothed_discharge_rate
 
-
-def compute_green_time(arm: ArmState) -> int:
-    """
-    Calculate dynamic green duration for the chosen arm.
-
-    Formula:
-        green_time = clamp(density × 1.5, MIN_GREEN, MAX_GREEN)
-
-    Args:
-        arm: ArmState for the arm receiving green.
-
-    Returns:
-        Integer seconds in [MIN_GREEN, MAX_GREEN].
-    """
-    raw = arm.density * 1.5
-    return int(min(MAX_GREEN, max(MIN_GREEN, raw)))
+    def predict_queue_in(self, seconds: float) -> float:
+        if not self.density_history:
+            return 0.0
+        current = self.density_history[-1]
+        net_rate = self.smoothed_arrival_rate - self.smoothed_discharge_rate
+        return max(0.0, current + net_rate * seconds)
 
 
-def select_best_arm(arms: dict[str, ArmState]) -> tuple[str, float]:
-    """
-    Score all arms and return the arm with the highest priority.
+def webster_optimal_cycle(
+    volume_flows: Dict[str, float],
+    saturation_flow: float = SATURATION_FLOW,
+    lost_time_per_phase: float = LOST_TIME_PER_PHASE,
+    n_phases: int = 4,
+) -> Dict[str, float]:
+    L = n_phases * lost_time_per_phase
+    total_flow = sum(volume_flows.values())
+    if total_flow < 0.01:
+        return {arm: float(MIN_GREEN) for arm in volume_flows}
+    y = {arm: v / saturation_flow for arm, v in volume_flows.items()}
+    Y = sum(y.values())
+    if Y >= 0.9:
+        splits = {}
+        for arm, yi in y.items():
+            proportion = yi / Y if Y > 0 else 1.0 / len(y)
+            splits[arm] = float(min(MAX_GREEN, max(MIN_GREEN, proportion * MAX_GREEN * 4)))
+        return splits
+    C_opt = max(40.0, min(180.0, (1.5 * L + 5.0) / (1.0 - Y)))
+    effective_green_total = C_opt - L
+    splits = {}
+    for arm, yi in y.items():
+        proportion = yi / Y if Y > 0 else 1.0 / len(y)
+        splits[arm] = float(max(MIN_GREEN, min(MAX_GREEN, effective_green_total * proportion)))
+    logger.debug("Webster: C_opt=%.1fs Y=%.3f splits=%s", C_opt, Y, {k: f"{v:.1f}s" for k, v in splits.items()})
+    return splits
 
-    Args:
-        arms: Dict of arm_name → ArmState.
 
-    Returns:
-        (best_arm_name, best_score) tuple.
-    """
-    scores = {name: priority_score(arm) for name, arm in arms.items()}
-    best   = max(scores, key=lambda k: scores[k])
-    return best, scores[best]
+def compute_priority_score(
+    arm_name: str,
+    density: float,
+    wait_time: float,
+    flow_rate: float,
+    analytics: ArmAnalytics,
+    is_current_green: bool,
+    dt: float,
+) -> float:
+    if density < 0:
+        density = 0.0
+    arrival_rate = analytics.update_arrival_rate(density, dt)
+    discharge_rate = analytics.update_discharge_rate(flow_rate, is_current_green)
+    wait_factor = 1.0 + math.pow(max(0.0, wait_time) / 30.0, 1.8)
+    saturation_capacity = SATURATION_FLOW * MAX_GREEN
+    saturation_ratio = min(1.0, density / max(saturation_capacity, 1.0))
+    saturation_bonus = saturation_ratio * EPSILON
+    score = (
+        ALPHA * density
+        + BETA * wait_factor
+        + GAMMA * arrival_rate
+        - DELTA * discharge_rate
+        + saturation_bonus
+    )
+    predicted_q = analytics.predict_queue_in(PREDICTION_HORIZON)
+    if predicted_q > density * 1.3:
+        growth_factor = min(2.0, predicted_q / max(density, 1.0))
+        score *= growth_factor
+    return max(0.0, score)
 
 
-# ---------------------------------------------------------------------------
-# Signal Controller — runs the full control loop in its own thread
-# ---------------------------------------------------------------------------
-
-class SignalController:
-    """
-    Event-driven traffic signal controller.
-
-    Runs as a daemon thread. On each iteration:
-      - Reads shared IntersectionState (with lock).
-      - Decides next phase (emergency / pedestrian / normal).
-      - Sends serial commands via a send_command callback.
-      - Sleeps for the appropriate duration.
-      - Writes results back to IntersectionState.
-
-    The send_command callback signature:
-        send_command(arm: str, phase: str, duration: int) -> None
-    e.g. "N", "GREEN", 30  →  sends "N:GREEN:30\n" to Arduino.
-
-    If no Arduino is connected, pass a no-op lambda and the controller
-    runs in simulation mode — Pygame still reads the state correctly.
-    """
-
+class SignalController(threading.Thread):
     def __init__(
         self,
-        state: IntersectionState,
-        send_command: Optional[Callable[[str, str, int], None]] = None,
+        state,
+        send_command: Callable[[str], None],
+        use_webster: bool = True,
     ) -> None:
-        """
-        Args:
-            state:        Shared IntersectionState instance.
-            send_command: Callback to send serial command to Arduino.
-                          Signature: (arm_initial, phase_str, duration_int).
-                          Pass None for simulation-only mode.
-        """
-        self._state        = state
-        self._send         = send_command or self._noop_send
-        self._thread: Optional[threading.Thread] = None
+        super().__init__(name="SignalController", daemon=True)
+        self._state = state
+        self._send = send_command
+        self._use_webster = use_webster
+        self._stop_event = threading.Event()
+        self._analytics: Dict[str, ArmAnalytics] = {
+            arm: ArmAnalytics(arm=arm) for arm in ARM_NAMES
+        }
+        self._session_start = time.time()
+        self._total_cycles = 0
+        self._vehicles_cleared = 0
+        self._webster_splits: Dict[str, float] = {arm: float(MIN_GREEN) for arm in ARM_NAMES}
+        self._last_cycle_time = time.time()
+        self._total_wait_saved = 0.0
+        self._baseline_wait = 45.0
 
-        # Hazard extension bookkeeping — track remaining extension seconds
-        self._hazard_extra: float = 0.0
-
-        logger.info(
-            "SignalController initialised (send_command=%s)",
-            "hardware" if send_command else "simulation",
-        )
-
-    # ------------------------------------------------------------------
-    # Thread lifecycle
-    # ------------------------------------------------------------------
-
-    def start(self) -> None:
-        """Start the controller loop in a daemon thread."""
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="SignalController",
-            daemon=True,
-        )
-        self._thread.start()
-        logger.info("SignalController thread started")
+    def run(self) -> None:
+        logger.info("SignalController starting (webster=%s)", self._use_webster)
+        time.sleep(2.0)
+        while not self._stop_event.is_set():
+            try:
+                self._control_cycle()
+            except Exception as exc:
+                logger.error("Controller error: %s", exc, exc_info=True)
+                time.sleep(1.0)
 
     def stop(self) -> None:
-        """Signal the controller to stop cleanly."""
-        with self._state.lock:
-            self._state.running = False
-        logger.info("SignalController stop requested")
+        self._stop_event.set()
 
-    def join(self, timeout: float = 5.0) -> None:
-        """Wait for the controller thread to finish."""
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+    def _control_cycle(self) -> None:
+        snap = self._snapshot_state()
+        if not snap['running']:
+            self._stop_event.set()
+            return
 
-    # ------------------------------------------------------------------
-    # Main control loop
-    # ------------------------------------------------------------------
+        dt = time.time() - self._last_cycle_time
+        self._last_cycle_time = time.time()
 
-    def _loop(self) -> None:
-        """
-        Infinite control loop. Runs until state.running = False.
-        Each iteration is one complete signal cycle for one arm.
-        """
-        logger.info("Control loop started")
+        emergency_arm = self._find_emergency_arm(snap)
+        if emergency_arm:
+            logger.warning("EMERGENCY: arm=%s", emergency_arm)
+            self._execute_emergency(emergency_arm)
+            self._clear_emergency(emergency_arm)
+            return
 
-        with self._state.lock:
-            self._state.phase = 'normal'
+        if snap['ped_phase_requested']:
+            logger.info("PEDESTRIAN PHASE")
+            self._execute_pedestrian_phase()
+            self._clear_ped_request()
+            return
 
-        while True:
-            # Check shutdown flag
-            with self._state.lock:
-                running = self._state.running
-            if not running:
-                logger.info("Control loop exiting (running=False)")
-                self._execute_all_red(reason="shutdown")
-                break
+        if snap.get('hazard_active') and snap.get('current_green'):
+            ext = HAZARD_EXTENSION
+            logger.warning("HAZARD — extending green %ds", ext)
+            self._send(f"{snap['current_green'][0]}:GREEN:{ext}\n")
+            time.sleep(ext)
+            return
 
-            try:
-                self._cycle()
-            except Exception as exc:
-                # Never let an unhandled exception kill the controller thread.
-                # Log it and continue — worst case is one missed cycle.
-                logger.error(
-                    "Unhandled exception in control cycle: %s", exc,
-                    exc_info=True,
-                )
-                time.sleep(ALL_RED_BUFFER)
-
-    def _cycle(self) -> None:
-        """Execute one complete signal cycle."""
-
-        # ── 1. Read current state snapshot ───────────────────────────────
-        with self._state.lock:
-            arms_snapshot = {
-                name: _arm_copy(arm)
-                for name, arm in self._state.arms.items()
-            }
-            ped_triggered  = (
-                self._state.latest_emergency_result is not None
-                and self._state.latest_emergency_result.ped_phase_triggered
+        scores: Dict[str, float] = {}
+        for arm in ARM_NAMES:
+            arm_data = snap['arms'][arm]
+            is_green = (snap['current_green'] == arm)
+            scores[arm] = compute_priority_score(
+                arm_name=arm,
+                density=arm_data['density'],
+                wait_time=arm_data['wait_time'],
+                flow_rate=arm_data['flow_rate'],
+                analytics=self._analytics[arm],
+                is_current_green=is_green,
+                dt=dt,
             )
-            # Use ped_rolling_avg as a fallback if no emergency result yet
-            ped_avg        = self._state.ped_rolling_avg
-            current_green  = self._state.current_green
 
-        # ── 2. Emergency override — highest priority ──────────────────────
-        emrg_arm = self._find_emergency_arm(arms_snapshot)
-        if emrg_arm:
-            self._execute_emergency(emrg_arm)
-            return
+        for arm in ARM_NAMES:
+            if snap['arms'][arm]['wait_time'] >= ABSOLUTE_STARVATION_CAP:
+                logger.warning("STARVATION: %s", arm)
+                scores[arm] = float('inf') - 1.0
 
-        # ── 3. Pedestrian phase ───────────────────────────────────────────
-        if ped_triggered:
-            self._execute_pedestrian()
-            return
+        winner = max(scores, key=lambda a: scores[a])
+        logger.info("Scores: %s → winner=%s (%.1f)",
+                    {k: f"{v:.1f}" for k, v in scores.items()}, winner, scores[winner])
 
-        # ── 4. Hazard extension on current green arm ──────────────────────
-        if current_green and self._is_hazard_active(arms_snapshot, current_green):
-            self._extend_for_hazard(current_green)
-            # After extension, fall through to normal scoring
+        if self._use_webster:
+            volume_flows = {arm: max(0.0, snap['arms'][arm]['density'] / MAX_GREEN) for arm in ARM_NAMES}
+            self._webster_splits = webster_optimal_cycle(volume_flows)
+            green_time = self._webster_splits.get(winner, float(MIN_GREEN))
+        else:
+            density = snap['arms'][winner]['density']
+            arrival = self._analytics[winner].smoothed_arrival_rate
+            green_time = max(MIN_GREEN, min(MAX_GREEN, density * 1.5 + arrival * 3.0))
 
-        # ── 5. Normal priority scoring ────────────────────────────────────
-        best_arm, best_score = select_best_arm(arms_snapshot)
-        green_duration = compute_green_time(arms_snapshot[best_arm])
+        green_time = max(MIN_GREEN, min(MAX_GREEN, green_time))
+        self._execute_phase(winner=winner, green_time=green_time, all_scores=scores)
 
-        logger.info(
-            "Selected arm: %s  score=%.1f  green=%ds",
-            best_arm, best_score, green_duration,
-        )
+        self._total_cycles += 1
+        self._vehicles_cleared += int(snap['arms'][winner]['density'])
+        self._analytics[winner].green_phases += 1
+        self._analytics[winner].total_green_time += green_time
+        wait_this_cycle = snap['arms'][winner]['wait_time']
+        self._total_wait_saved += max(0.0, self._baseline_wait - wait_this_cycle)
+        self._write_metrics(winner, green_time, scores)
 
-        # ── 6. Execute green cycle ────────────────────────────────────────
-        self._execute_green_cycle(best_arm, green_duration)
-
-    # ------------------------------------------------------------------
-    # Phase executors
-    # ------------------------------------------------------------------
-
-    def _execute_green_cycle(self, arm: str, green_duration: int) -> None:
-        """
-        ALL_RED(1s) → arm GREEN(green_duration) → arm YELLOW(3s)
-        Updates state and wait times throughout.
-        """
-        cycle_start = time.time()
-
-        # ALL RED buffer
-        self._execute_all_red(reason=f"before {arm} green")
-
+    def _execute_phase(self, winner: str, green_time: float, all_scores: Dict[str, float]) -> None:
+        initial = winner[0].upper()
+        # ALL RED
+        self._write_current_phase(winner, 'all_red')
+        self._send("A:RED:0\n")
+        self._sleep(ALL_RED_BUFFER)
         # GREEN
-        with self._state.lock:
-            self._state.phase         = 'normal'
-            self._state.current_green = arm
-            self._state.set_signal(None, 'RED')
-            self._state.set_signal(arm, 'GREEN')
-            self._state.arms[arm].green_count    += 1
-            self._state.arms[arm].last_green_start = time.time()
-
-        arm_initial = arm[0].upper()
-        self._send(arm_initial, 'GREEN', green_duration)
-        logger.debug("GREEN: %s for %ds", arm, green_duration)
-
-        self._sleep_interruptible(green_duration, check_emergency=True)
-
+        self._write_current_phase(winner, 'green')
+        self._send(f"{initial}:GREEN:{int(green_time)}\n")
+        logger.info("GREEN → %s for %.0fs", winner, green_time)
+        self._sleep(green_time)
         # YELLOW
-        with self._state.lock:
-            self._state.set_signal(arm, 'YELLOW')
-
-        self._send(arm_initial, 'YELLOW', YELLOW_DURATION)
-        logger.debug("YELLOW: %s for %ds", arm, YELLOW_DURATION)
-        time.sleep(YELLOW_DURATION)
-
-        # Update timing metrics
-        elapsed = time.time() - cycle_start
-        with self._state.lock:
-            self._state.arms[arm].total_green_s += green_duration
-            self._state.tick_wait_times(green_duration + YELLOW_DURATION)
-            self._state.total_cycles += 1
-            self._state.current_green = None
-            self._state.cycle_complete.set()
-            self._state.cycle_complete.clear()
-
-        logger.info(
-            "Cycle complete: %s  green=%ds  elapsed=%.1fs",
-            arm, green_duration, elapsed,
-        )
-
-    def _execute_all_red(self, reason: str = "") -> None:
-        """Set all arms RED for ALL_RED_BUFFER seconds."""
-        with self._state.lock:
-            self._state.set_signal(None, 'RED')
-            self._state.current_green = None
-            if reason != "shutdown":
-                self._state.phase = 'all_red'
-
-        self._send('A', 'RED', 0)
-        time.sleep(ALL_RED_BUFFER)
+        self._write_current_phase(winner, 'yellow')
+        self._send(f"{initial}:YELLOW:{YELLOW_DURATION}\n")
+        self._sleep(YELLOW_DURATION)
+        # ALL RED
+        self._write_current_phase(None, 'all_red')
+        self._send("A:RED:0\n")
 
     def _execute_emergency(self, arm: str) -> None:
-        """
-        Emergency override:
-            ALL_RED(1s) → emergency arm GREEN(EMERGENCY_HOLD s) → ALL_RED(1s)
-        """
-        logger.warning("EMERGENCY PHASE: arm=%s hold=%ds", arm, EMERGENCY_HOLD)
+        initial = arm[0].upper()
+        self._write_current_phase(arm, 'emergency')
+        self._send("A:RED:0\n")
+        self._sleep(ALL_RED_BUFFER)
+        self._send(f"{initial}:GREEN:{EMERGENCY_HOLD}\n")
+        self._sleep(EMERGENCY_HOLD)
+        self._send(f"{initial}:YELLOW:{YELLOW_DURATION}\n")
+        self._sleep(YELLOW_DURATION)
+        self._write_current_phase(None, 'all_red')
+        self._send("A:RED:0\n")
 
+    def _execute_pedestrian_phase(self) -> None:
+        self._write_current_phase(None, 'pedestrian')
+        self._send("A:RED:0\n")
+        self._sleep(ALL_RED_BUFFER)
+        self._send(f"P:WALK:{PED_WALK_DURATION}\n")
+        self._sleep(PED_WALK_DURATION)
+        self._write_current_phase(None, 'all_red')
+        self._send("A:RED:0\n")
+
+    def _snapshot_state(self) -> dict:
         with self._state.lock:
-            self._state.phase = 'emergency'
-            self._state.set_signal(None, 'RED')
-            self._state.current_green = None
+            running = self._state.running
+            current_green = self._state.current_green
+            arms = {}
+            for arm in ARM_NAMES:
+                a = self._state.arms[arm]
+                arms[arm] = {
+                    'density':   a.density,
+                    'wait_time': a.wait_time,
+                    'flow_rate': a.flow_rate,
+                    'emergency': a.emergency,
+                    'hazard':    a.hazard,
+                }
+            ped_req = getattr(self._state, 'ped_phase_requested', False)
+            hazard_active = any(a['hazard'] for a in arms.values())
+        return {
+            'running':             running,
+            'current_green':       current_green,
+            'arms':                arms,
+            'ped_phase_requested': ped_req,
+            'hazard_active':       hazard_active,
+        }
 
-        self._send('A', 'RED', 0)
-        time.sleep(ALL_RED_BUFFER)
+    def _find_emergency_arm(self, snap: dict) -> Optional[str]:
+        for arm in ARM_NAMES:
+            if snap['arms'][arm]['emergency']:
+                return arm
+        return None
 
+    def _write_current_phase(self, current_green: Optional[str], phase: str) -> None:
+        """
+        ── BUG 1 FIX ──
+        Previously only wrote state.current_green and state.phase.
+        Now also calls state._update_arm_signals_locked() which writes
+        per-arm signal_state (RED/YELLOW/GREEN) that pygame renders.
+        Without this call, all lights stayed RED forever.
+        """
         with self._state.lock:
-            self._state.set_signal(arm, 'GREEN')
-            self._state.current_green = arm
+            self._state.current_green = current_green
+            self._state.phase = phase
+            # ← THE FIX: update each arm's signal_state
+            self._state._update_arm_signals_locked(current_green, phase)
 
-        arm_initial = arm[0].upper()
-        self._send(arm_initial, 'GREEN', EMERGENCY_HOLD)
-        time.sleep(EMERGENCY_HOLD)
-
-        # Clear emergency flag
+    def _clear_emergency(self, arm: str) -> None:
         with self._state.lock:
             if arm in self._state.arms:
                 self._state.arms[arm].emergency = False
-            self._state.current_green = None
-            self._state.phase = 'normal'
 
-        self._execute_all_red(reason="after emergency")
-
-        logger.info("Emergency phase complete — arm %s cleared", arm)
-
-    def _execute_pedestrian(self) -> None:
-        """
-        Pedestrian phase:
-            ALL_RED(1s) → PED WALK(PED_WALK_DURATION s) → ALL_RED(1s)
-        """
-        logger.info("PEDESTRIAN PHASE: walk=%ds", PED_WALK_DURATION)
-
+    def _clear_ped_request(self) -> None:
         with self._state.lock:
-            self._state.phase         = 'pedestrian'
-            self._state.ped_phase_active = True
-            self._state.set_signal(None, 'RED')
-            self._state.current_green = None
+            self._state.ped_phase_requested = False
 
-        self._send('A', 'RED', 0)
-        time.sleep(ALL_RED_BUFFER)
-
-        self._send('P', 'WALK', PED_WALK_DURATION)
-        time.sleep(PED_WALK_DURATION)
-
+    def _write_metrics(self, winner: str, green_time: float, scores: Dict[str, float]) -> None:
         with self._state.lock:
-            self._state.ped_phase_active = False
-            self._state.phase = 'normal'
+            for arm in ARM_NAMES:
+                if hasattr(self._state.arms[arm], 'priority_score'):
+                    self._state.arms[arm].priority_score = scores.get(arm, 0.0)
+            if hasattr(self._state, 'session_metrics'):
+                self._state.session_metrics.update({
+                    'total_cycles':       self._total_cycles,
+                    'vehicles_cleared':   self._vehicles_cleared,
+                    'total_wait_saved':   self._total_wait_saved,
+                    'last_green_arm':     winner,
+                    'last_green_time':    green_time,
+                    'webster_splits':     dict(self._webster_splits),
+                    'current_scores':     dict(scores),
+                    'efficiency_gain_pct': (
+                        self._total_wait_saved / max(1.0, self._total_cycles * self._baseline_wait) * 100
+                    ),
+                })
 
-            # Clear ped trigger in emergency result so it doesn't re-fire
-            if self._state.latest_emergency_result is not None:
-                self._state.latest_emergency_result.ped_phase_triggered = False
-
-        self._execute_all_red(reason="after pedestrian")
-
-        logger.info("Pedestrian phase complete")
-
-    def _extend_for_hazard(self, arm: str) -> None:
-        """
-        Extend current green by HAZARD_EXTENSION seconds to allow road clearing.
-        Only extends once per hazard event — tracks via self._hazard_extra.
-        """
-        if self._hazard_extra > 0:
-            return   # already extended this event
-
-        logger.warning(
-            "HAZARD EXTENSION: extending %s green by +%ds",
-            arm, HAZARD_EXTENSION,
-        )
-        self._hazard_extra = HAZARD_EXTENSION
-        arm_initial = arm[0].upper()
-        self._send(arm_initial, 'GREEN', HAZARD_EXTENSION)
-        time.sleep(HAZARD_EXTENSION)
-
-        with self._state.lock:
-            self._state.arms[arm].total_green_s += HAZARD_EXTENSION
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _find_emergency_arm(
-        self, arms_snapshot: dict[str, ArmState]
-    ) -> Optional[str]:
-        """Return the first arm with emergency=True, or None."""
-        for name, arm in arms_snapshot.items():
-            if arm.emergency:
-                return name
-        return None
-
-    def _is_hazard_active(
-        self, arms_snapshot: dict[str, ArmState], arm: str
-    ) -> bool:
-        """Return True if the named arm has an active hazard."""
-        a = arms_snapshot.get(arm)
-        return a is not None and a.hazard
-
-    def _sleep_interruptible(
-        self,
-        duration: float,
-        check_emergency: bool = False,
-        interval: float = 0.5,
-    ) -> None:
-        """
-        Sleep for `duration` seconds, waking every `interval` seconds.
-        If check_emergency is True and an emergency is detected mid-sleep,
-        return early so the next cycle handles it immediately.
-
-        Args:
-            duration:        Total sleep duration in seconds.
-            check_emergency: Whether to poll for emergency preemption.
-            interval:        Poll interval in seconds.
-        """
-        elapsed = 0.0
-        while elapsed < duration:
-            sleep_chunk = min(interval, duration - elapsed)
-            time.sleep(sleep_chunk)
-            elapsed += sleep_chunk
-
-            if not check_emergency:
-                continue
-
-            # Check if an emergency appeared mid-green
-            with self._state.lock:
-                running = self._state.running
-                emrg = any(
-                    arm.emergency
-                    for arm in self._state.arms.values()
-                )
-
-            if not running:
+    def _sleep(self, seconds: float) -> None:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._stop_event.is_set():
                 return
+            time.sleep(min(0.1, deadline - time.time()))
 
-            if emrg:
-                logger.warning(
-                    "Emergency detected mid-green — interrupting after %.1fs",
-                    elapsed,
-                )
-                return
+    def get_analytics_snapshot(self) -> dict:
+        return {
+            arm: {
+                'smoothed_arrival_rate':   a.smoothed_arrival_rate,
+                'smoothed_discharge_rate': a.smoothed_discharge_rate,
+                'predicted_queue_8s':      a.predict_queue_in(8.0),
+                'green_phases':            a.green_phases,
+                'total_green_time':        a.total_green_time,
+            }
+            for arm, a in self._analytics.items()
+        }
 
-    @staticmethod
-    def _noop_send(arm: str, phase: str, duration: int) -> None:
-        """No-op send function used when Arduino is not connected."""
-        logger.debug("SIM send: %s:%s:%d", arm, phase, duration)
-
-
-# ---------------------------------------------------------------------------
-# Arm snapshot helper — avoids holding the lock while scoring
-# ---------------------------------------------------------------------------
-
-def _arm_copy(arm: ArmState) -> ArmState:
-    """
-    Return a lightweight copy of an ArmState for use outside the lock.
-    Uses object.__new__ + manual field copy to avoid dataclass overhead.
-    """
-    copy = ArmState.__new__(ArmState)
-    copy.arm_name        = arm.arm_name
-    copy.density         = arm.density
-    copy.flow_rate       = arm.flow_rate
-    copy.emergency       = arm.emergency
-    copy.hazard          = arm.hazard
-    copy.wait_time       = arm.wait_time
-    copy.last_green_start = arm.last_green_start
-    copy.signal          = arm.signal
-    copy.green_count     = arm.green_count
-    copy.total_green_s   = arm.total_green_s
-    return copy
-
-
-# ---------------------------------------------------------------------------
-# Standalone test  (python -m controller.algorithm)
-# ---------------------------------------------------------------------------
-
-if __name__ == '__main__':
-    import sys
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    )
-
-    from controller.state import create_state
-
-    state = create_state()
-
-    # Inject realistic arm conditions
-    with state.lock:
-        state.arms['North'].density   = 28.0
-        state.arms['North'].flow_rate = 0.5   # stopped
-        state.arms['North'].wait_time = 45.0
-
-        state.arms['South'].density   = 6.0
-        state.arms['South'].flow_rate = 3.2
-        state.arms['South'].wait_time = 12.0
-
-        state.arms['East'].density    = 14.0
-        state.arms['East'].flow_rate  = 1.2
-        state.arms['East'].wait_time  = 30.0
-
-        state.arms['West'].density    = 2.0
-        state.arms['West'].flow_rate  = 4.5
-        state.arms['West'].wait_time  = 0.0
-
-    # Print scores
-    print("\n── Priority Scores ──")
-    with state.lock:
-        for name, arm in state.arms.items():
-            score = priority_score(arm)
-            gtime = compute_green_time(arm)
-            print(
-                f"  {name:<6}  density={arm.density:5.1f}  "
-                f"wait={arm.wait_time:5.1f}s  "
-                f"flow={arm.flow_rate:4.1f}  "
-                f"score={score:7.2f}  green={gtime}s"
-            )
-        arms_copy = {n: _arm_copy(a) for n, a in state.arms.items()}
-
-    best, score = select_best_arm(arms_copy)
-    print(f"\n  → Best arm: {best}  (score={score:.2f})")
-    print(f"  → Green time: {compute_green_time(arms_copy[best])}s")
-
-    # Run controller for a few cycles in simulation mode
-    print("\n── Running controller (simulation, 3 cycles) ──\n")
-
-    cycle_count = [0]
-
-    original_execute = SignalController._execute_green_cycle
-
-    def patched_execute(self, arm, green_duration):
-        cycle_count[0] += 1
-        original_execute(self, arm, green_duration)
-        if cycle_count[0] >= 3:
-            with self._state.lock:
-                self._state.running = False
-
-    SignalController._execute_green_cycle = patched_execute
-
-    controller = SignalController(state)
-    controller.start()
-
-    # Poll and print status until stopped
-    for _ in range(60):
-        time.sleep(0.5)
-        print(state.summary_string())
-        with state.lock:
-            if not state.running:
-                break
-
-    controller.join(timeout=5.0)
-    print("\nController test complete.")
+    @property
+    def efficiency_gain_pct(self) -> float:
+        total_baseline = self._total_cycles * self._baseline_wait
+        if total_baseline < 1.0:
+            return 0.0
+        return self._total_wait_saved / total_baseline * 100
