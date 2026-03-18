@@ -5698,3 +5698,136 @@ TypeError: ArduinoController.get_send_callback.<locals>.<lambda>() missing 2 req
 09:43:27 [INFO    ] __main__: CameraManager stopped
 09:43:27 [INFO    ] __main__: Session summary: cycles=5 cleared=8 uptime=89s
 09:43:27 [INFO    ] __main__: Shutdown complete.
+10:23:33 [INFO    ] __main__: ============================================================
+10:23:33 [INFO    ] __main__: AI Smart Traffic System — Starting up
+10:23:33 [INFO    ] __main__: ============================================================
+10:23:33 [INFO    ] __main__: Using per-arm camera sources
+10:23:33 [INFO    ] utils.camera_manager: CameraManager starting — 4 arms
+10:23:33 [INFO    ] utils.camera_manager:   North  ← assets/n.mp4
+10:23:33 [INFO    ] utils.camera_manager:   South  ← assets/s.mp4
+10:23:33 [INFO    ] utils.camera_manager:   East   ← assets/e.mp4
+10:23:33 [INFO    ] utils.camera_manager:   West   ← assets/w.mp4
+10:23:33 [INFO    ] __main__: CameraManager started (4 reader threads)
+10:23:33 [INFO    ] __main__: Arduino: skipped (simulation mode)
+10:23:33 [INFO    ] controller.algorithm: SignalController starting (webster=True)
+10:23:33 [INFO    ] __main__: Signal controller started
+10:23:33 [INFO    ] __main__: Detection thread starting (reading from CameraManager)
+10:23:33 [INFO    ] __main__: Detection thread started
+10:23:33 [INFO    ] utils.camera_manager: [North] VideoCapture open ← assets/n.mp4
+10:23:33 [INFO    ] utils.camera_manager: [South] VideoCapture open ← assets/s.mp4
+10:23:33 [INFO    ] utils.camera_manager: [West] VideoCapture open ← assets/w.mp4
+10:23:33 [INFO    ] utils.camera_manager: [East] VideoCapture open ← assets/e.mp4
+10:23:35 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:23:36 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:23:49 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:23:50 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:23:50 [INFO    ] detection.detector: Loading YOLOv8 model: yolov8n.pt (input_size=416)
+10:23:52 [INFO    ] detection.detector: YOLOv8 model loaded and warmed up (CPU mode, size=416)
+10:23:52 [INFO    ] detection.density: DensityEstimator initialized for arms: ['North', 'South', 'East', 'West']
+10:23:52 [INFO    ] detection.flow: FlowAnalyser initialized
+10:23:52 [INFO    ] detection.emergency: EmergencyDetector ready — emergency_classes=['ambulance', 'fire truck', 'fire_truck']  ped_threshold=8
+10:23:52 [INFO    ] __main__: Detection pipeline initialized
+10:23:52 [INFO    ] __main__: Camera feeds ready — starting detection loop
+10:23:52 [INFO    ] __main__: DashboardBridge started
+10:23:52 [INFO    ] __main__: Pygame simulation starting (main thread)
+10:23:52 [INFO    ] simulation.pygame_sim: Pygame simulation started 1411x794 @30fps
+10:24:03 [INFO    ] controller.algorithm: Scores: {'North': '18.0', 'South': '11.3', 'East': '8.0', 'West': '11.3'} → winner=North (18.0)
+10:24:04 [INFO    ] controller.algorithm: GREEN → North for 19s
+10:24:23 [INFO    ] __main__: Shutdown signal received (2) — stopping...
+10:24:23 [INFO    ] __main__: Detection thread stopped (frames=111)
+10:24:49 [INFO    ] __main__: ============================================================
+10:24:49 [INFO    ] __main__: AI Smart Traffic System — Starting up
+10:24:49 [INFO    ] __main__: ============================================================
+10:24:49 [INFO    ] __main__: Using per-arm camera sources
+10:24:49 [INFO    ] utils.camera_manager: CameraManager starting — 4 arms
+10:24:49 [INFO    ] utils.camera_manager:   North  ← assets/n.mp4
+10:24:49 [INFO    ] utils.camera_manager:   South  ← assets/s.mp4
+10:24:49 [INFO    ] utils.camera_manager:   East   ← assets/e.mp4
+10:24:49 [INFO    ] utils.camera_manager:   West   ← assets/w.mp4
+10:24:49 [INFO    ] __main__: CameraManager started (4 reader threads)
+10:24:49 [INFO    ] __main__: Arduino: skipped (simulation mode)
+10:24:49 [INFO    ] controller.algorithm: SignalController starting (webster=True)
+10:24:49 [INFO    ] __main__: Signal controller started
+10:24:49 [INFO    ] __main__: Detection thread starting (reading from CameraManager)
+10:24:49 [INFO    ] __main__: Detection thread started
+10:24:49 [INFO    ] utils.camera_manager: [North] VideoCapture open ← assets/n.mp4
+10:24:50 [INFO    ] utils.camera_manager: [South] VideoCapture open ← assets/s.mp4
+10:24:50 [INFO    ] utils.camera_manager: [West] VideoCapture open ← assets/w.mp4
+10:24:50 [INFO    ] utils.camera_manager: [East] VideoCapture open ← assets/e.mp4
+10:24:51 [INFO    ] __main__: Shutdown signal received (2) — stopping...
+10:25:14 [INFO    ] detection.detector: Loading YOLOv8 model: yolov8n.pt (input_size=416)
+10:25:17 [INFO    ] detection.detector: YOLOv8 model loaded and warmed up (CPU mode, size=416)
+10:25:17 [INFO    ] detection.density: DensityEstimator initialized for arms: ['North', 'South', 'East', 'West']
+10:25:17 [INFO    ] detection.flow: FlowAnalyser initialized
+10:25:17 [INFO    ] detection.emergency: EmergencyDetector ready — emergency_classes=['ambulance', 'fire truck', 'fire_truck']  ped_threshold=8
+10:25:17 [INFO    ] __main__: Detection pipeline initialized
+10:25:17 [INFO    ] __main__: Camera feeds ready — starting detection loop
+10:25:17 [INFO    ] __main__: Detection thread stopped (frames=0)
+10:25:18 [INFO    ] __main__: DashboardBridge started
+10:25:18 [INFO    ] __main__: Pygame simulation starting (main thread)
+10:25:18 [INFO    ] simulation.pygame_sim: Pygame simulation started 1411x794 @30fps
+10:25:55 [INFO    ] __main__: ============================================================
+10:25:55 [INFO    ] __main__: AI Smart Traffic System — Starting up
+10:25:55 [INFO    ] __main__: ============================================================
+10:25:55 [INFO    ] __main__: Using per-arm camera sources
+10:25:55 [INFO    ] utils.camera_manager: CameraManager starting — 4 arms
+10:25:55 [INFO    ] utils.camera_manager:   North  ← assets/n.mp4
+10:25:55 [INFO    ] utils.camera_manager:   South  ← assets/s.mp4
+10:25:55 [INFO    ] utils.camera_manager:   East   ← assets/e.mp4
+10:25:55 [INFO    ] utils.camera_manager:   West   ← assets/w.mp4
+10:25:55 [INFO    ] __main__: CameraManager started (4 reader threads)
+10:25:55 [INFO    ] __main__: Arduino: skipped (simulation mode)
+10:25:55 [INFO    ] utils.camera_manager: [North] VideoCapture open ← assets/n.mp4
+10:25:55 [INFO    ] controller.algorithm: SignalController starting (webster=True)
+10:25:55 [INFO    ] __main__: Signal controller started
+10:25:55 [INFO    ] __main__: Detection thread starting (reading from CameraManager)
+10:25:55 [INFO    ] __main__: Detection thread started
+10:25:55 [INFO    ] utils.camera_manager: [South] VideoCapture open ← assets/s.mp4
+10:25:55 [INFO    ] utils.camera_manager: [West] VideoCapture open ← assets/w.mp4
+10:25:55 [INFO    ] utils.camera_manager: [East] VideoCapture open ← assets/e.mp4
+10:25:57 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:25:58 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:26:11 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:26:13 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:26:26 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:26:27 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:26:40 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:26:41 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:26:46 [INFO    ] detection.detector: Loading YOLOv8 model: yolov8n.pt (input_size=416)
+10:26:54 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:26:55 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:26:59 [INFO    ] detection.detector: YOLOv8 model loaded and warmed up (CPU mode, size=416)
+10:26:59 [INFO    ] detection.density: DensityEstimator initialized for arms: ['North', 'South', 'East', 'West']
+10:26:59 [INFO    ] detection.flow: FlowAnalyser initialized
+10:26:59 [INFO    ] detection.emergency: EmergencyDetector ready — emergency_classes=['ambulance', 'fire truck', 'fire_truck']  ped_threshold=8
+10:26:59 [INFO    ] __main__: Detection pipeline initialized
+10:26:59 [INFO    ] __main__: Camera feeds ready — starting detection loop
+10:26:59 [INFO    ] __main__: DashboardBridge started
+10:27:00 [INFO    ] __main__: Pygame simulation starting (main thread)
+10:27:00 [INFO    ] simulation.pygame_sim: Pygame simulation started 1411x794 @30fps
+10:27:08 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '8.0', 'East': '8.0', 'West': '8.0'} → winner=North (8.0)
+10:27:09 [INFO    ] controller.algorithm: GREEN → North for 10s
+10:27:22 [INFO    ] controller.algorithm: Scores: {'North': '8.0', 'South': '14.7', 'East': '8.0', 'West': '18.0'} → winner=West (18.0)
+10:27:23 [INFO    ] controller.algorithm: GREEN → West for 19s
+10:27:38 [INFO    ] simulation.pygame_sim: Pygame simulation stopped
+10:27:38 [INFO    ] __main__: Initiating shutdown...
+10:27:38 [INFO    ] __main__: Controller stopped
+10:27:38 [INFO    ] hardware.arduino: Arduino disconnected
+10:27:38 [INFO    ] __main__: Arduino disconnected
+10:27:38 [INFO    ] __main__: Detection thread stopped
+10:27:38 [INFO    ] utils.camera_manager: CameraManager stopping...
+10:27:39 [INFO    ] utils.camera_manager: CameraManager stopped
+10:27:39 [INFO    ] __main__: CameraManager stopped
+10:27:39 [INFO    ] __main__: Session summary: cycles=0 cleared=0 uptime=169s
+10:27:39 [INFO    ] __main__: Shutdown complete.
+10:27:39 [INFO    ] simulation.pygame_sim: Pygame simulation stopped
+10:27:39 [INFO    ] __main__: Initiating shutdown...
+10:27:40 [INFO    ] __main__: Controller stopped
+10:27:40 [INFO    ] hardware.arduino: Arduino disconnected
+10:27:40 [INFO    ] __main__: Arduino disconnected
+10:27:40 [INFO    ] __main__: Detection thread stopped
+10:27:40 [INFO    ] utils.camera_manager: CameraManager stopping...
+10:27:40 [INFO    ] utils.camera_manager: CameraManager stopped
+10:27:40 [INFO    ] __main__: CameraManager stopped
+10:27:40 [INFO    ] __main__: Session summary: cycles=3 cleared=3 uptime=247s
+10:27:40 [INFO    ] __main__: Shutdown complete.
